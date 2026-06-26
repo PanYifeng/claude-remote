@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""IDE 终端注册工具 — 在 IDE 终端中运行，将当前 Claude Code 注册到 daemon
+
+在 IntelliJ/PyCharm/VS Code 的终端中运行此脚本：
+  python3 /path/to/ide-register
+
+脚本会自动：
+1. 检测当前 IDE 应用名称（IntelliJ IDEA、PyCharm、Code 等）
+2. 生成 UUID 并注册到 daemon
+3. 每 5 秒发送心跳，保持 daemon 知道 session 是活的
+4. 退出时通知 daemon 清理
+
+也可用于独立终端中已存在的 claude 会话：
+  python3 /path/to/ide-register --pid <claude-pid>
+"""
+
+import argparse
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+DAEMON_URL = os.getenv("CCR_DAEMON_URL", "http://localhost:9998")
+
+
+def detect_ide_app() -> str:
+    """检测当前终端进程所属的 IDE 应用
+
+    通过检查父进程链来识别：
+    - 如果父进程是 idea/pycharm/code → 在 IDE 终端内
+    - 否则 → 独立终端
+    """
+    try:
+        # 获取当前进程的父进程链
+        pid = os.getppid()
+        seen = set()
+        while pid > 1 and pid not in seen:
+            seen.add(pid)
+            try:
+                with open(f"/proc/{pid}/comm") as f:
+                    comm = f.read().strip()
+            except FileNotFoundError:
+                # macOS 用 ps
+                result = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "comm="],
+                    capture_output=True, text=True, timeout=3,
+                )
+                comm = result.stdout.strip().split("/")[-1] if result.stdout else ""
+
+            # 检查是否匹配 IDE 进程名
+            ide_map = {
+                "idea": "IntelliJ IDEA",
+                "pycharm": "PyCharm",
+                "webstorm": "WebStorm",
+                "code": "Code",
+                "code-insiders": "Code - Insiders",
+                "cursor": "Cursor",
+                "windsurf": "Windsurf",
+                "Terminal": "",
+                "iTerm2": "",
+            }
+            for key, name in ide_map.items():
+                if key.lower() in comm.lower():
+                    return name or comm
+
+            # 继续往上找父进程
+            try:
+                result = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "ppid="],
+                    capture_output=True, text=True, timeout=3,
+                )
+                pid = int(result.stdout.strip())
+            except (ValueError, subprocess.TimeoutExpired):
+                break
+    except Exception:
+        pass
+    return ""
+
+
+def register_session(session_id: str, app_name: str, cwd: str, pid: int) -> bool:
+    """向 daemon 注册 IDE session"""
+    session_type = "ide" if app_name else "standalone"
+    data = {
+        "id": session_id,
+        "name": f"{app_name or '终端'} — {os.path.basename(cwd)}",
+        "cwd": cwd,
+        "pid": pid,
+        "session_type": session_type,
+        "app_name": app_name,
+        "win_title": "",
+    }
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-X", "POST",
+             f"{DAEMON_URL}/api/session/register",
+             "-H", "Content-Type: application/json",
+             "-d", json.dumps(data, ensure_ascii=False)],
+            capture_output=True, text=True, timeout=5,
+        )
+        resp = json.loads(result.stdout)
+        return resp.get("ok", False)
+    except Exception as e:
+        print(f"注册失败: {e}", file=sys.stderr)
+        return False
+
+
+def heartbeat(session_id: str) -> None:
+    """发送心跳"""
+    try:
+        subprocess.run(
+            ["curl", "-s", "-X", "PUT",
+             f"{DAEMON_URL}/api/session/{session_id}/heartbeat",
+             "-H", "Content-Type: application/json",
+             "-d", json.dumps({"pid": os.getpid()})],
+            capture_output=True, timeout=3,
+        )
+    except Exception:
+        pass
+
+
+def unregister(session_id: str) -> None:
+    """注销 session"""
+    try:
+        subprocess.run(
+            ["curl", "-s", "-X", "DELETE",
+             f"{DAEMON_URL}/api/session/{session_id}"],
+            capture_output=True, timeout=3,
+        )
+    except Exception:
+        pass
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="将当前 Claude Code 会话注册到 daemon 远程控制",
+    )
+    parser.add_argument(
+        "--pid", type=int, default=os.getppid(),
+        help="要监控的进程 PID（默认: 父进程）",
+    )
+    parser.add_argument(
+        "--name", type=str, default="",
+        help="会话名称（默认: 自动检测）",
+    )
+    parser.add_argument(
+        "--once", action="store_true",
+        help="仅注册一次，不保持心跳（用于独立终端手动注册）",
+    )
+    args = parser.parse_args()
+
+    # 检测 IDE 应用
+    app_name = detect_ide_app()
+
+    # 生成 session ID
+    session_id = str(uuid.uuid4())
+    cwd = os.getcwd()
+    pid = args.pid
+
+    # 注册到 daemon
+    ok = register_session(session_id, app_name, cwd, pid)
+    if not ok:
+        print(f"❌ 注册失败 — 请确认 daemon 正在运行 ({DAEMON_URL})")
+        sys.exit(1)
+
+    if app_name:
+        print(f"✅ 已注册 IDE 终端: {app_name}")
+        print(f"   Session ID: {session_id[:8]}...")
+        print(f"   在飞书中使用 /list 查看，/send {session_id[:8]} <命令> 控制")
+    else:
+        print(f"✅ 已注册当前终端（独立）")
+        print(f"   Session ID: {session_id[:8]}...")
+
+    if args.once:
+        return
+
+    # 心跳循环
+    def cleanup(*_args):
+        unregister(session_id)
+        print("\n已注销")
+
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    try:
+        while True:
+            heartbeat(session_id)
+            time.sleep(5)
+    except KeyboardInterrupt:
+        cleanup()
+
+
+if __name__ == "__main__":
+    main()

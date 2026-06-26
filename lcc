@@ -1,0 +1,133 @@
+#!/bin/bash
+# lcc - Claude Code Remote Control Wrapper
+#
+# 包装 claude 命令，启动 screen 会话并通过 daemon 注册远程控制。
+# 安装: sudo cp lcc /usr/local/bin/lcc && chmod +x /usr/local/bin/lcc
+#
+# 使用:
+#   lcc                    # 启动后台 claude 会话（可 screen -r 附接查看）
+#   lcc --foreground       # 在当前终端启动（等同直接运行 claude）
+#   lcc --name "论文搜索"  # 指定会话名称
+#   lcc --help             # 显示帮助
+
+set -euo pipefail
+
+# ── 配置 ──────────────────────────────────────────────
+DAEMON_URL="${CCR_DAEMON_URL:-http://localhost:9998}"
+UUID="${CCR_SESSION_ID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}"
+SCREEN_NAME="claude-${UUID:0:12}"
+CWD="$(pwd)"
+LOG_FILE="/tmp/claude-${UUID}.log"
+SESSION_NAME=""
+
+# ── 解析参数 ──────────────────────────────────────────
+FOREGROUND=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --foreground|-f)
+            FOREGROUND=true
+            shift
+            ;;
+        --name|-n)
+            SESSION_NAME="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "lcc - Claude Code Remote Control Wrapper"
+            echo ""
+            echo "用法: lcc [选项] -- [claude 参数...]"
+            echo ""
+            echo "选项:"
+            echo "  --foreground, -f    在前台运行（等同直接运行 claude）"
+            echo "  --name, -n <名称>   设置会话名称"
+            echo "  --help, -h          显示此帮助"
+            echo ""
+            echo "环境变量:"
+            echo "  CCR_DAEMON_URL      Daemon 地址 (默认: http://localhost:9998)"
+            echo "  CCR_SESSION_ID      手动指定 session ID（默认自动生成）"
+            echo ""
+            echo "后台模式: screen -r claude-<id> 可附接查看"
+            echo ""
+            echo "示例:"
+            echo "  lcc                          # 启动后台 claude"
+            echo "  lcc --name 论文搜索           # 带名称启动"
+            echo "  lcc --foreground               # 前台运行"
+            echo "  lcc -- python train.py        # 直接运行 python"
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# ── 注册 session 到 daemon ──────────────────────────
+register_session() {
+    local name="${SESSION_NAME:-$(basename "$CWD")}"
+    curl -s -X POST "${DAEMON_URL}/api/session/register" \
+        -H "Content-Type: application/json" \
+        -d "{\"id\":\"${UUID}\",\"name\":\"${name}\",\"cwd\":\"${CWD}\",\"pid\":$$}" \
+        > /dev/null 2>&1 || true
+}
+
+# ── 心跳循环（后台模式使用） ──────────────────────
+heartbeat_loop() {
+    # 等待屏幕会话启动
+    sleep 1
+    while true; do
+        # 检查 screen 是否存在
+        if ! screen -S "${SCREEN_NAME}" -Q select . >/dev/null 2>&1; then
+            break
+        fi
+        # 发送心跳
+        curl -s -X PUT "${DAEMON_URL}/api/session/${UUID}/heartbeat" \
+            -H "Content-Type: application/json" \
+            -d "{\"pid\":$$}" > /dev/null 2>&1 || true
+        sleep 5
+    done
+    # 会话结束，通知 daemon
+    curl -s -X DELETE "${DAEMON_URL}/api/session/${UUID}" > /dev/null 2>&1 || true
+}
+
+# ── 清理 ────────────────────────────────────────────
+cleanup() {
+    curl -s -X DELETE "${DAEMON_URL}/api/session/${UUID}" > /dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# ── 启动 ────────────────────────────────────────────
+register_session
+
+if $FOREGROUND; then
+    # 前台模式：直接在当前终端运行 claude
+    # 仍然创建 screen 并注册，但保持前台
+    echo "lcc: Starting claude (foreground mode) — session: ${UUID:0:8}"
+    # 启动 heartbeat 后台
+    heartbeat_loop &
+    HEARTBEAT_PID=$!
+    # 确实运行 claude（同时捕获输出用于监控）
+    script -q "${LOG_FILE}" claude "$@"
+    wait $HEARTBEAT_PID 2>/dev/null || true
+else
+    # 后台模式：创建 screen detached session
+    echo "lcc: Starting claude in screen session: ${SCREEN_NAME}"
+    echo "     Attach: screen -r ${SCREEN_NAME}"
+    echo "     Session ID: ${UUID:0:8}"
+
+    # 清空日志
+    : > "${LOG_FILE}"
+
+    # 在 detached screen 中启动 claude
+    screen -dmS "${SCREEN_NAME}" bash -c "
+        cd '${CWD}'
+        : > '${LOG_FILE}'
+        script -q -a '${LOG_FILE}' -c 'claude $*'
+    "
+
+    # 心跳循环（阻塞，直到退出）
+    heartbeat_loop
+fi
