@@ -539,17 +539,15 @@ class Daemon:
                     )
                     continue
 
-                # For terminal sessions: try log file first, then AppleScript Terminal reading
-                if stype == "terminal":
-                    output, _ = await self.screen_mgr.read_output(session_id, 10)
-
-                    # If log file doesn't exist (session not started via lcc),
-                    # read Terminal window content directly via AppleScript
-                    if not output:
-                        try:
-                            output, _ = self.ide_ctrl.read_terminal_output(15)
-                        except Exception:
-                            pass
+                # For terminal sessions: read log output and detect waiting state
+                if stype in ("terminal",):
+                    if stype == "terminal":
+                        output, _ = await self.screen_mgr.read_output(session_id, 10)
+                        if not output:
+                            try:
+                                output, _ = self.ide_ctrl.read_terminal_output(15)
+                            except Exception:
+                                pass
 
                     if output:
                         self.registry.update(
@@ -562,26 +560,23 @@ class Daemon:
                         status = "waiting"
                     elif not output:
                         status = "running"
-                    else:
-                        if pid:
-                            try:
-                                proc = await asyncio.create_subprocess_exec(
-                                    "ps", "-p", str(pid), "-o", "state=",
-                                    stdout=asyncio.subprocess.PIPE,
-                                    stderr=asyncio.subprocess.DEVNULL,
-                                )
-                                stdout, _ = await proc.communicate()
-                                state = stdout.decode().strip()
-                                if state == "S":
-                                    status = "idle"
-                                elif state in ("R", "D"):
-                                    status = "running"
-                                else:
-                                    status = "running"
-                            except Exception:
+                    elif pid:
+                        try:
+                            proc = await asyncio.create_subprocess_exec(
+                                "ps", "-p", str(pid), "-o", "state=",
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.DEVNULL,
+                            )
+                            stdout, _ = await proc.communicate()
+                            state = stdout.decode().strip()
+                            if state == "S":
+                                status = "idle" if not log_status else "waiting"
+                            else:
                                 status = "running"
-                        else:
+                        except Exception:
                             status = "running"
+                    else:
+                        status = "running"
 
                     if status != s.get("status"):
                         logger.info(
@@ -591,7 +586,7 @@ class Daemon:
                         self.registry.update(session_id, status=status)
                     self.registry.update(session_id, updated_at=now)
                 else:
-                    # ide/standalone: just keep alive via heartbeat freshness
+                    # ide/standalone: keep alive only, no expensive clipboard ops
                     self.registry.update(session_id, updated_at=now)
 
                 continue

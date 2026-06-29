@@ -20,22 +20,24 @@ from ide_control import IDEControl
 
 logger = logging.getLogger("lark_bot")
 
+# Per-chat session context: maps chat_id -> {"selected": session_id, "sessions": [sorted_by_recent]}
+_session_context: dict[str, dict] = {}
+
 COMMAND_HELP = """
-/l list                       — List all sessions (💻=terminal, 🔌=IDE)
-/ls                           — Same as /list
-/status <id>                  — Show session details
-/send <id> <text>             — Send command to session
-/confirm <id>                 — Confirm operation (Enter)
+/l list                       — List all sessions with [N] shortcuts
+/status <id|N>                — Show session details + quick actions
+/send <id|N> <text>           — Send command to session
+/confirm [id|N]               — Confirm (Enter). No arg = last session
 /pending                      — List sessions waiting for input
-/confirm-all                  — Confirm all waiting sessions at once
-/select <id> <n>              — Select option N
-/interrupt <id>               — Send Ctrl+C
-/stop <id>                    — Stop session
+/confirm-all                  — Confirm all waiting sessions
+/select <id|N> <n>            — Select option N
+/interrupt [id|N]             — Send Ctrl+C. No arg = last session
+/stop <id|N>                  — Stop session
 /help                         — Show this help
 
-Remote control types:
-💻 terminal — Native terminal (via screen command pipe / AppleScript)
-🔌 IDE      — IDE terminal (via macOS Accessibility keyboard simulation)
+Tips:
+  * Use number shortcuts: `/confirm 1`, `/status 2`, `/send 3 pwd`
+  * `/confirm` or `/interrupt` without ID acts on last session
 """
 
 
@@ -53,18 +55,7 @@ class LarkBot:
         self.ide_ctrl = ide_ctrl or IDEControl()
 
     async def handle_event_line(self, line: dict) -> Optional[dict]:
-        """Process a single event from the event consume stream
-
-        lark-cli event consume output format:
-        {
-            "chat_id": "oc_xxx",
-            "chat_type": "p2p",
-            "content": "message text",
-            "message_id": "om_xxx",
-            "message_type": "text",
-            "sender_id": "ou_xxx",
-        }
-        """
+        """Process a single event from the event consume stream"""
         try:
             msg_type = line.get("message_type", "")
             content = line.get("content", "")
@@ -75,7 +66,7 @@ class LarkBot:
             if not content or not chat_id:
                 return None
 
-            response = await self._process_command(content.strip(), sender_id)
+            response = await self._process_command(content.strip(), chat_id)
             if response:
                 await self._reply_message(chat_id, message_id, response)
 
@@ -85,64 +76,41 @@ class LarkBot:
             return None
 
     async def handle_webhook(self, body: dict) -> Optional[dict]:
-        """Handle Lark event callback (webhook mode, retained for compatibility)
-
-        Event types:
-        - url_verification: URL challenge
-        - im.message.receive_v1: User message received
-        """
+        """Handle Lark event callback (webhook mode, retained for compatibility)"""
         event_type = body.get("type", "")
-
         if event_type == "url_verification":
             return {"challenge": body.get("challenge", "")}
-
         event = body.get("event", {})
         header = body.get("header", {})
-
         if header.get("event_type") == "im.message.receive_v1":
             return await self._handle_message_event(event)
-
         if event_type == "im.message.receive_v1":
             return await self._handle_message_event(event)
-
         logger.info("Unhandled event type: %s", event_type)
         return None
 
     async def _handle_message_event(self, event: dict) -> Optional[dict]:
-        """Handle received user message"""
+        """Handle received user message (webhook path)"""
         try:
             message = event.get("message", {})
             sender = event.get("sender", {})
-
             msg_type = message.get("message_type", "")
             content_str = message.get("content", "{}")
-
             text = self._extract_text(msg_type, content_str)
             if not text:
                 return None
-
-            sender_id = (
-                sender.get("sender_id", {}).get("open_id", "")
-                or sender.get("user_id", "")
-            )
+            sender_id = sender.get("sender_id", {}).get("open_id", "") or sender.get("user_id", "")
             chat_id = message.get("chat_id", "")
-
-            response = await self._process_command(text.strip(), sender_id)
+            response = await self._process_command(text.strip(), chat_id)
             if response:
                 await self._send_message(chat_id, response)
-
             return {"code": 0}
         except Exception as e:
             logger.error("Failed to handle message event: %s", e, exc_info=True)
             return None
 
-    async def _process_command(
-        self, text: str, sender_id: str
-    ) -> Optional[str]:
-        """Parse and execute command
-
-        Format: /command [args...]
-        """
+    async def _process_command(self, text: str, chat_id: str) -> Optional[str]:
+        """Parse and execute command. Format: /command [args...]"""
         if not text.startswith("/"):
             return None
 
@@ -171,199 +139,207 @@ class LarkBot:
         handler = handlers.get(cmd)
         if not handler:
             return f"Unknown command: /{cmd}\n{COMMAND_HELP}"
+        return await handler(args, chat_id)
 
-        return await handler(args)
+    async def _resolve_target(self, arg: str, chat_id: str) -> Optional[str]:
+        """Resolve arg to session ID: numeric index or short UUID"""
+        ctx = _session_context.get(chat_id)
+        if not ctx:
+            ctx = _session_context.setdefault(chat_id, {"sessions": []})
+        if arg.isdigit():
+            idx = int(arg) - 1
+            cached = ctx.get("sessions", [])
+            if 0 <= idx < len(cached):
+                return cached[idx]
+            return None
+        return self._resolve_id(arg)
 
-    async def _cmd_list(self, _args: list[str]) -> str:
-        """List all sessions"""
+    def _update_list_cache(self, chat_id: str) -> list:
+        """Refresh session cache and return sorted list"""
         sessions = self.registry.list()
+        ctx = _session_context.setdefault(chat_id, {})
+        ctx["sessions"] = [s["id"] for s in sessions]
+        return sessions
 
+    def _find_index(self, session_id: str, chat_id: str) -> int:
+        """Find 1-based index of session in list cache"""
+        ctx = _session_context.get(chat_id, {})
+        for i, sid in enumerate(ctx.get("sessions", []), 1):
+            if sid == session_id:
+                return i
+        return -1
+
+    # ── Command handlers ─────────────────────────────
+
+    async def _cmd_list(self, _args: list[str], chat_id: str) -> str:
+        """List all sessions with numbered shortcuts"""
+        sessions = self._update_list_cache(chat_id)
         if not sessions:
             return "📭 No active Claude Code sessions."
-
-        lines = ["📋 **Claude Code Session List**\n"]
-        for s in sessions:
-            status_icon = {
-                "running": "🟢",
-                "waiting": "🟡",
-                "idle": "⚪",
-                "stopped": "🔴",
-                "error": "❌",
-            }.get(s.get("status", ""), "⚪")
-
-            stype = s.get("session_type", "screen")
-            type_icon = {"screen": "💻", "ide": "🔌", "standalone": "💻", "terminal": "💻"}.get(stype, "💻")
-
-            sid = s["id"][:8]
-            name = s.get("name", "") or sid
-            cwd = s.get("cwd", "") or "-"
-            created = s.get("created_at", 0)
-            elapsed = self._format_elapsed(created)
-            app = s.get("app_name", "")
-
-            line = f"{status_icon} {type_icon} `{sid}` — **{name}**\n"
-            if stype == "ide":
-                line += f"  · App: `{app or '-'}`\n"
-            else:
-                line += f"  · Dir: `{cwd}`\n"
-            line += f"  · Running: {elapsed}\n"
-
-            lines.append(line)
-
-        lines.append(f"\n{len(sessions)} session(s) total")
-        lines.append("Use `/status <id>` for details")
-        lines.append("Use `/help` for all commands")
+        lines = ["📋 **Claude Code Sessions**\n"]
+        for i, s in enumerate(sessions, 1):
+            icon = {"running": "🟢", "waiting": "🟡", "idle": "⚪", "stopped": "🔴", "error": "❌"}.get(s.get("status", ""), "⚪")
+            stype = {"screen": "💻", "ide": "🔌"}.get(s.get("session_type", "screen"), "💻")
+            name = s.get("name", "") or s["id"][:8]
+            elapsed = self._format_elapsed(s.get("created_at", 0))
+            lines.append(f"`[{i}]` {icon} {stype} **{name}**\n     · Run: {elapsed}\n")
+        lines.append(f"\n{len(sessions)} session(s)")
+        lines.append("Quick: `/confirm 1` `/status 2` `/send 3 pwd` `/interrupt 2`")
         return "\n".join(lines)
 
-    async def _cmd_status(self, args: list[str]) -> str:
-        """Show session details"""
+    async def _cmd_status(self, args: list[str], chat_id: str) -> str:
+        """Show session details with quick action hints"""
         if not args:
-            return "Usage: `/status <session_id>`\ne.g. `/status abc12345`"
-
-        session_id = self._resolve_id(args[0])
+            return "Usage: `/status <id|N>`\ne.g. `/status 1`"
+        session_id = await self._resolve_target(args[0], chat_id)
         if not session_id:
             return f"❌ Session not found: `{args[0]}`"
-
         s = self.registry.get(session_id)
         if not s:
             return f"❌ Session no longer exists"
 
+        idx = self._find_index(session_id, chat_id)
+        short_id = session_id[:8]
         stype = s.get("session_type", "screen")
-        status_icon = {
-            "running": "🟢 Running",
-            "waiting": "🟡 Waiting for input",
-            "idle": "⚪ Idle",
-            "stopped": "🔴 Stopped",
-            "error": "❌ Error",
-        }.get(s.get("status", ""), s.get("status", "Unknown"))
+        status_icon = {"running": "🟢 Running", "waiting": "🟡 Waiting", "idle": "⚪ Idle", "stopped": "🔴 Stopped", "error": "❌ Error"}.get(s.get("status", ""), "Unknown")
+        idx_tag = f" [{idx}]" if idx > 0 else ""
 
-        lines = [
-            f"📊 **Session Details**\n",
-            f"  · ID: `{session_id[:12]}...`",
-            f"  · Name: {s.get('name', '-')}",
-            f"  · Status: {status_icon}",
-        ]
+        lines = [f"📊 **Session{idx_tag}: {s.get('name', '-')}**\n"]
+        lines.append(f"  · ID: `{short_id}`  · Status: {status_icon}")
         if stype == "ide":
-            lines.append(f"  · Type: 🔌 IDE Terminal ({s.get('app_name', '-')})")
+            lines.append(f"  · Type: 🔌 {s.get('app_name', '-')}")
         elif stype == "terminal":
-            lines.append(f"  · Type: 💻 Native Terminal")
+            lines.append(f"  · Type: 💻 Terminal")
         else:
-            lines.append(f"  · Type: 💻 Screen Session")
+            lines.append(f"  · Type: 💻 Screen")
         lines.append(f"  · Dir: `{s.get('cwd', '-')}`")
-        lines.append(f"  · PID: {s.get('pid', '-')}")
         lines.append(f"  · Created: {self._format_elapsed(s.get('created_at', 0))} ago")
 
         if stype == "ide":
-            app_name = s.get("app_name", "")
-            output, line_count = self.ide_ctrl.read_output(app_name, 15)
+            output, lc = self.ide_ctrl.read_output(s.get("app_name", ""), 15)
             if output:
-                lines.append(f"\n📄 **Latest Output** ({line_count} lines):")
-                lines.append(f"```\n{output[-500:]}\n```")
+                lines.append(f"\n📄 **Output** ({lc} lines):\n```\n{output[-500:]}\n```")
             else:
-                lines.append("\n📄 Could not read IDE terminal output.")
-                lines.append("   Please ensure Accessibility permission is granted.")
+                lines.append("\n📄 Could not read output — check Accessibility permission.")
         elif stype == "terminal":
-            # Try log file first, then Terminal.app content
-            output, line_count = await self.screen_mgr.read_output(session_id, 15)
+            output, lc = await self.screen_mgr.read_output(session_id, 15)
             if not output:
-                output, line_count = self.ide_ctrl.read_terminal_output(15)
+                output, lc = self.ide_ctrl.read_terminal_output(15)
             if output:
-                lines.append(f"\n📄 **Latest Output** ({line_count} lines):")
-                lines.append(f"```\n{output[-500:]}\n```")
+                lines.append(f"\n📄 **Output** ({lc} lines):\n```\n{output[-500:]}\n```")
         else:
-            output, line_count = await self.screen_mgr.read_output(session_id, 15)
+            output, lc = await self.screen_mgr.read_output(session_id, 15)
             if output:
-                lines.append(f"\n📄 **Latest Output** ({line_count} lines):")
-                lines.append(f"```\n{output[-500:]}\n```")
+                lines.append(f"\n📄 **Output** ({lc} lines):\n```\n{output[-500:]}\n```")
 
-        if s.get("status") in ("waiting", "running", "idle"):
-            lines.append(
-                "\n💡 Available actions:\n"
-                f"  · `/confirm {session_id[:8]}` — Confirm (Enter)\n"
-                f"  · `/send {session_id[:8]} <command>` — Send command\n"
-                f"  · `/interrupt {session_id[:8]}` — Ctrl+C\n"
-                f"  · `/stop {session_id[:8]}` — Stop"
-            )
-
+        idx_s = str(idx) if idx > 0 else short_id
+        lines.append(f"\n⚡ `/confirm {idx_s}` `/interrupt {idx_s}` `/stop {idx_s}` `/send {idx_s} <cmd>`")
         return "\n".join(lines)
 
-    async def _cmd_send(self, args: list[str]) -> str:
+    async def _cmd_send(self, args: list[str], chat_id: str) -> str:
         """Send command to session"""
         if len(args) < 2:
-            return "Usage: `/send <session_id> <text>`\ne.g. `/send abc12345 python train.py`"
-
-        session_id = self._resolve_id(args[0])
+            return "Usage: `/send <id|N> <text>`\ne.g. `/send 1 pwd`"
+        session_id = await self._resolve_target(args[0], chat_id)
         if not session_id:
             return f"❌ Session not found: `{args[0]}`"
-
         text = " ".join(args[1:])
         s = self.registry.get(session_id)
         if not s:
             return f"❌ Session no longer exists"
-
         stype = s.get("session_type", "screen")
         if stype == "ide":
-            app = s.get("app_name", "")
-            ok = self.ide_ctrl.send_keys(app, text)
+            ok = self.ide_ctrl.send_keys(s.get("app_name", ""), text)
         elif stype == "terminal":
-            app = s.get("app_name") or "Terminal"
-            ok = self.ide_ctrl.send_keys(app, text)
+            ok = self.ide_ctrl.send_keys(s.get("app_name", "") or "Terminal", text)
         else:
             ok = await self.screen_mgr.send_keys(session_id, text)
-
         if ok:
             self.registry.update(session_id, status="running")
-            type_tag = "🔌 IDE" if stype == "ide" else "💻"
-            return f"✅ {type_tag} Sent command to `{session_id[:8]}...`:\n```\n$ {text}\n```"
+            _session_context.setdefault(chat_id, {})["selected"] = session_id
+            return f"✅ Sent to {s.get('name', session_id[:8])}:\n```\n$ {text}\n```"
+        return f"❌ Send failed, session may be stopped"
+
+    async def _cmd_confirm(self, args: list[str], chat_id: str) -> str:
+        """Confirm (Enter). No arg = last session."""
+        if args:
+            session_id = await self._resolve_target(args[0], chat_id)
         else:
-            return f"❌ Send failed, session may be stopped"
-
-    async def _cmd_confirm(self, args: list[str]) -> str:
-        """Confirm operation (Enter)"""
-        if not args:
-            return "Usage: `/confirm <session_id>`"
-
-        session_id = self._resolve_id(args[0])
+            session_id = _session_context.get(chat_id, {}).get("selected")
+            if not session_id:
+                return "Usage: `/confirm <id|N>` or `/confirm` (last session)"
         if not session_id:
-            return f"❌ Session not found: `{args[0]}`"
-
+            return f"❌ Session not found"
         s = self.registry.get(session_id)
         if not s:
             return f"❌ Session no longer exists"
-
         stype = s.get("session_type", "screen")
         if stype == "ide":
             ok = self.ide_ctrl.send_enter(s.get("app_name", ""))
         elif stype == "terminal":
-            app = s.get("app_name") or "Terminal"
-            ok = self.ide_ctrl.send_enter(app)
+            ok = self.ide_ctrl.send_enter(s.get("app_name", "") or "Terminal")
         else:
             ok = await self.screen_mgr.send_enter(session_id)
-
         if ok:
             self.registry.update(session_id, status="running")
-            return f"✅ Confirmed `{session_id[:8]}...`"
-        else:
-            return f"❌ Operation failed, session may be stopped"
+            return f"✅ Confirmed `{session_id[:8]}`"
+        return f"❌ Confirm failed"
 
-    async def _cmd_select(self, args: list[str]) -> str:
-        """Select option"""
+    async def _cmd_pending(self, _args: list[str], chat_id: str) -> str:
+        """List waiting-for-input sessions with indexes"""
+        self._update_list_cache(chat_id)
+        sessions = self.registry.list(status_filter="waiting")
+        if not sessions:
+            return "✅ No sessions waiting for input."
+        ctx = _session_context.get(chat_id, {})
+        order = ctx.get("sessions", [])
+        lines = ["🟡 **Waiting Sessions**\n"]
+        for s in sessions:
+            idx = next((i for i, sid in enumerate(order, 1) if sid == s["id"]), -1)
+            icon = {"screen": "💻", "ide": "🔌"}.get(s.get("session_type", "screen"), "💻")
+            name = s.get("name", "") or s["id"][:8]
+            lines.append(f"{icon} `[{idx}]` **{name}**  · {self._format_elapsed(s.get('created_at', 0))}\n")
+        lines.append(f"\n{len(sessions)} waiting — `/confirm-all` or `/confirm 1` `/confirm 2`")
+        return "\n".join(lines)
+
+    async def _cmd_confirm_all(self, _args: list[str], chat_id: str) -> str:
+        """Confirm all waiting sessions"""
+        sessions = self.registry.list(status_filter="waiting")
+        if not sessions:
+            return "✅ No sessions waiting for input."
+        success = failed = 0
+        first_sid = None
+        for s in sessions:
+            ok = await self._confirm_from_bot(s)
+            if ok:
+                success += 1
+                if first_sid is None:
+                    first_sid = s["id"]
+            else:
+                failed += 1
+        if first_sid:
+            _session_context.setdefault(chat_id, {})["selected"] = first_sid
+        parts = []
+        if success:
+            parts.append(f"✅ Confirmed {success}")
+        if failed:
+            parts.append(f"❌ Failed {failed}")
+        return " — ".join(parts)
+
+    async def _cmd_select(self, args: list[str], chat_id: str) -> str:
+        """Select an option number"""
         if len(args) < 2:
-            return "Usage: `/select <session_id> <number>`\ne.g. `/select abc12345 2`"
-
-        session_id = self._resolve_id(args[0])
+            return "Usage: `/select <id|N> <n>`\ne.g. `/select 1 2`"
+        session_id = await self._resolve_target(args[0], chat_id)
         if not session_id:
             return f"❌ Session not found: `{args[0]}`"
-
         try:
             option = int(args[1])
         except ValueError:
             return "❌ Option must be a number"
-
         s = self.registry.get(session_id)
         if not s:
             return f"❌ Session no longer exists"
-
         stype = s.get("session_type", "screen")
         if stype in ("ide", "terminal"):
             app = s.get("app_name") or ("Terminal" if stype == "terminal" else "")
@@ -372,54 +348,46 @@ class LarkBot:
                 self.ide_ctrl.send_enter(app)
         else:
             ok = await self.screen_mgr.select_option(session_id, option)
-
         if ok:
             self.registry.update(session_id, status="running")
-            return f"✅ Selected option {option} → `{session_id[:8]}...`"
+            return f"✅ Selected option {option} → `{session_id[:8]}`"
+        return f"❌ Select failed"
+
+    async def _cmd_interrupt(self, args: list[str], chat_id: str) -> str:
+        """Send Ctrl+C. No arg = last session."""
+        if args:
+            session_id = await self._resolve_target(args[0], chat_id)
         else:
-            return f"❌ Operation failed, session may be stopped"
-
-    async def _cmd_interrupt(self, args: list[str]) -> str:
-        """Send Ctrl+C"""
-        if not args:
-            return "Usage: `/interrupt <session_id>`"
-
-        session_id = self._resolve_id(args[0])
+            session_id = _session_context.get(chat_id, {}).get("selected")
+            if not session_id:
+                return "Usage: `/interrupt <id|N>` or `/interrupt` (last session)"
         if not session_id:
-            return f"❌ Session not found: `{args[0]}`"
-
+            return f"❌ Session not found"
         s = self.registry.get(session_id)
         if not s:
             return f"❌ Session no longer exists"
-
         stype = s.get("session_type", "screen")
         if stype == "ide":
             ok = self.ide_ctrl.send_ctrl_c(s.get("app_name", ""))
         elif stype == "terminal":
-            app = s.get("app_name") or "Terminal"
-            ok = self.ide_ctrl.send_ctrl_c(app)
+            ok = self.ide_ctrl.send_ctrl_c(s.get("app_name", "") or "Terminal")
         else:
             ok = await self.screen_mgr.send_ctrl_c(session_id)
-
         if ok:
             self.registry.update(session_id, status="running")
-            return f"⚠️ Sent interrupt to `{session_id[:8]}...`"
-        else:
-            return f"❌ Operation failed, session may be stopped"
+            return f"⚠️ Interrupted `{session_id[:8]}`"
+        return f"❌ Interrupt failed"
 
-    async def _cmd_stop(self, args: list[str]) -> str:
+    async def _cmd_stop(self, args: list[str], chat_id: str) -> str:
         """Stop session"""
         if not args:
-            return "Usage: `/stop <session_id>`"
-
-        session_id = self._resolve_id(args[0])
+            return "Usage: `/stop <id|N>`\ne.g. `/stop 1`"
+        session_id = await self._resolve_target(args[0], chat_id)
         if not session_id:
             return f"❌ Session not found: `{args[0]}`"
-
         s = self.registry.get(session_id)
         if not s:
             return f"❌ Session no longer exists"
-
         stype = s.get("session_type", "screen")
         if stype in ("ide", "terminal"):
             app = s.get("app_name") or ("Terminal" if stype == "terminal" else "")
@@ -430,105 +398,44 @@ class LarkBot:
             await self.screen_mgr.send_keys(session_id, "exit")
             await asyncio.sleep(1)
             await self.screen_mgr.kill(session_id)
-
         self.registry.update(session_id, status="stopped")
-        return f"⏹️ Stopped session `{session_id[:8]}...`"
+        return f"⏹️ Stopped `{session_id[:8]}`"
 
-    async def _cmd_help(self, _args: list[str]) -> str:
+    async def _cmd_help(self, _args: list[str], chat_id: str) -> str:
         """Show help"""
         return COMMAND_HELP
 
-    async def _cmd_pending(self, _args: list[str]) -> str:
-        """List all sessions waiting for input"""
-        sessions = self.registry.list(status_filter="waiting")
-
-        if not sessions:
-            return "✅ No sessions waiting for input."
-
-        lines = ["🟡 **Sessions Waiting for Input**\n"]
-        for s in sessions:
-            sid = s["id"][:8]
-            name = s.get("name", "") or sid
-            stype = s.get("session_type", "screen")
-            icon = {"screen": "💻", "ide": "🔌", "standalone": "💻", "terminal": "💻"}.get(stype, "💻")
-            created = s.get("created_at", 0)
-            elapsed = self._format_elapsed(created)
-
-            lines.append(
-                f"{icon} `{sid}` — **{name}**\n"
-                f"  · Running: {elapsed}\n"
-            )
-
-        lines.append(f"\n{len(sessions)} session(s) waiting")
-        lines.append("Use `/confirm-all` to confirm all at once")
-        lines.append("or `/confirm <id>` individually")
-        return "\n".join(lines)
-
-    async def _cmd_confirm_all(self, _args: list[str]) -> str:
-        """Confirm (Enter) all waiting sessions"""
-        sessions = self.registry.list(status_filter="waiting")
-
-        if not sessions:
-            return "✅ No sessions waiting for input."
-
-        success = 0
-        failed = 0
-
-        for s in sessions:
-            ok = await self._confirm_from_bot(s)
-            if ok:
-                success += 1
-            else:
-                failed += 1
-
-        parts = []
-        if success:
-            parts.append(f"✅ Confirmed {success}")
-        if failed:
-            parts.append(f"❌ Failed {failed}")
-        return " — ".join(parts)
-
     async def _confirm_from_bot(self, s: dict) -> bool:
-        """Send Enter to a session (used from bot commands)"""
+        """Send Enter to a session"""
         session_id = s["id"]
         stype = s.get("session_type", "screen")
-
         if stype == "ide":
             ok = self.ide_ctrl.send_enter(s.get("app_name", ""))
         elif stype == "terminal":
-            app = s.get("app_name") or "Terminal"
-            ok = self.ide_ctrl.send_enter(app)
+            ok = self.ide_ctrl.send_enter(s.get("app_name", "") or "Terminal")
         else:
             ok = await self.screen_mgr.send_enter(session_id)
-
         if ok:
             self.registry.update(session_id, status="running")
         return ok
+
+    # ── Message send helpers ──────────────────────────
 
     async def _send_message(self, chat_id: str, text: str) -> bool:
         """Send message via lark-cli"""
         if not chat_id:
             logger.warning("No chat_id for sending message")
             return False
-
         try:
             content = json.dumps({"text": text}, ensure_ascii=False)
             proc = await asyncio.create_subprocess_exec(
-                "lark-cli", "im", "send",
-                "--chat-id", chat_id,
-                "--msg-type", "text",
-                "--content", content,
-                "--as", "bot",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                "lark-cli", "im", "send", "--chat-id", chat_id, "--msg-type", "text",
+                "--content", content, "--as", "bot",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=10
-            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
             if proc.returncode != 0:
-                logger.error(
-                    "Failed to send Lark message: %s", stderr.decode()
-                )
+                logger.error("Failed to send Lark message: %s", stderr.decode())
                 return False
             return True
         except Exception as e:
@@ -539,23 +446,15 @@ class LarkBot:
         """Reply to a message (creates thread)"""
         if not chat_id or not message_id:
             return await self._send_message(chat_id, text)
-
         try:
             proc = await asyncio.create_subprocess_exec(
-                "lark-cli", "im", "+messages-reply",
-                "--message-id", message_id,
-                "--text", text,
-                "--as", "bot",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                "lark-cli", "im", "+messages-reply", "--message-id", message_id,
+                "--text", text, "--as", "bot",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=10
-            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
             if proc.returncode != 0:
-                logger.error(
-                    "Failed to reply Lark message: %s", stderr.decode()
-                )
+                logger.error("Failed to reply Lark message: %s", stderr.decode())
                 return False
             return True
         except Exception as e:
@@ -577,7 +476,6 @@ class LarkBot:
             content = json.loads(content_str) if isinstance(content_str, str) else content_str
         except json.JSONDecodeError:
             return str(content_str) if content_str else None
-
         if msg_type == "text":
             return content.get("text", "")
         return None
