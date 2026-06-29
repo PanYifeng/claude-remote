@@ -1,4 +1,4 @@
-"""Claude Code Shell 远程控制系统 — 配置模块"""
+"""Claude Code Remote Control System — Configuration module"""
 
 import os
 import pathlib
@@ -8,38 +8,21 @@ from typing import Optional
 
 @dataclass
 class Config:
-    """从环境变量读取配置"""
+    """Read configuration from environment variables"""
 
-    # Daemon 端口
     daemon_port: int = int(os.getenv("CCR_DAEMON_PORT", "9998"))
-
-    # 数据目录（SQLite 数据库、运行时文件）
     data_dir: pathlib.Path = pathlib.Path(
         os.getenv("CCR_DATA_DIR", pathlib.Path.home() / ".claude-remote")
     ).expanduser().resolve()
-
-    # Claude 二进制路径
     claude_bin: str = os.getenv("CCR_CLAUDE_BIN", "claude")
-
-    # Lark 应用凭证
     lark_app_id: Optional[str] = os.getenv("LARK_APP_ID")
     lark_app_secret: Optional[str] = os.getenv("LARK_APP_SECRET")
-
-    # Lark 消息接收者（用户 open_id / chat_id）
     lark_user_id: Optional[str] = os.getenv("CCR_LARK_USER_ID")
-
-    # Cloudflare 隧道域名（可选，用于 Lark webhook 验证回调）
     tunnel_domain: Optional[str] = os.getenv("CCR_TUNNEL_DOMAIN")
-
-    # 日志文件路径
     log_path: str = os.getenv("CCR_LOG_PATH", "/tmp/claude-daemon.log")
-
-    # 监控配置
-    health_check_interval: float = 5.0   # 健康检查间隔（秒）
-    waiting_timeout: float = 5.0         # 判断为 waiting 的空闲超时（秒）
-    output_tail_lines: int = 50           # 读取 log 尾部行数
-
-    # log 文件目录
+    health_check_interval: float = 5.0
+    waiting_timeout: float = 5.0
+    output_tail_lines: int = 50
     log_dir: pathlib.Path = field(init=False)
 
     def __post_init__(self):
@@ -57,5 +40,4 @@ class Config:
         self._db_path = value
 
 
-# 全局单例
 config = Config()

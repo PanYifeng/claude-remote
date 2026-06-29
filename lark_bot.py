@@ -1,10 +1,10 @@
-"""Lark 机器人 — 事件消费与消息收发
+"""Lark Bot — Event consumption and message handling
 
-使用 lark-cli 的事件消费能力而非 webhook：
-- 通过 `lark-cli event consume im.message.receive_v1 --as bot` 接收消息
-- 通过 `lark-cli im send` 发送回复
+Uses lark-cli event consumption instead of webhook:
+- Receives messages via `lark-cli event consume im.message.receive_v1 --as bot`
+- Sends replies via `lark-cli im send`
 
-无需 Cloudflare 隧道或公网 webhook。
+No Cloudflare tunnel or public webhook required.
 """
 
 import asyncio
@@ -20,27 +20,25 @@ from ide_control import IDEControl
 
 logger = logging.getLogger("lark_bot")
 
-# 可用的命令及说明
 COMMAND_HELP = """
-/l list                       — 列出所有 session（💻=终端, 🔌=IDE）
-/ls                           — 同 /list
-/status <id>                  — 查看 session 详情
-/send <id> <text>             — 向 session 发送命令
-/confirm <id>                 — 确认操作（回车）
-/select <id> <n>              — 选择第 N 个选项
-/interrupt <id>               — 发送 Ctrl+C
-/stop <id>                    — 终止 session
-/help                         — 显示此帮助
+/l list                       — List all sessions (💻=terminal, 🔌=IDE)
+/ls                           — Same as /list
+/status <id>                  — Show session details
+/send <id> <text>             — Send command to session
+/confirm <id>                 — Confirm operation (Enter)
+/select <id> <n>              — Select option N
+/interrupt <id>               — Send Ctrl+C
+/stop <id>                    — Stop session
+/help                         — Show this help
 
-远程控制类型:
-💻 screen — 独立终端（通过 screen 命令管道控制）
-🔌 IDE    — IDE 终端（通过 macOS 辅助功能模拟键盘）
-📡 支持独立终端 / IntelliJ / PyCharm / VS Code / Cursor
+Remote control types:
+💻 terminal — Native terminal (via screen command pipe / AppleScript)
+🔌 IDE      — IDE terminal (via macOS Accessibility keyboard simulation)
 """
 
 
 class LarkBot:
-    """通过 lark-cli 和 Lark Open API 实现机器人消息处理"""
+    """Lark bot message handling via lark-cli"""
 
     def __init__(
         self,
@@ -53,13 +51,13 @@ class LarkBot:
         self.ide_ctrl = ide_ctrl or IDEControl()
 
     async def handle_event_line(self, line: dict) -> Optional[dict]:
-        """处理从 event consume 流接收到的单条事件
+        """Process a single event from the event consume stream
 
-        lark-cli event consume 输出格式:
+        lark-cli event consume output format:
         {
             "chat_id": "oc_xxx",
             "chat_type": "p2p",
-            "content": "消息文本内容",
+            "content": "message text",
             "message_id": "om_xxx",
             "message_type": "text",
             "sender_id": "ou_xxx",
@@ -75,7 +73,6 @@ class LarkBot:
             if not content or not chat_id:
                 return None
 
-            # 处理命令
             response = await self._process_command(content.strip(), sender_id)
             if response:
                 await self._reply_message(chat_id, message_id, response)
@@ -86,27 +83,23 @@ class LarkBot:
             return None
 
     async def handle_webhook(self, body: dict) -> Optional[dict]:
-        """处理 Lark 事件回调（webhook 方式，兼容保留）
+        """Handle Lark event callback (webhook mode, retained for compatibility)
 
-        Lark 事件类型:
-        - url_verification: URL 验证挑战
-        - im.message.receive_v1: 收到用户消息
+        Event types:
+        - url_verification: URL challenge
+        - im.message.receive_v1: User message received
         """
         event_type = body.get("type", "")
 
-        # URL 验证
         if event_type == "url_verification":
             return {"challenge": body.get("challenge", "")}
 
-        # 事件回调
         event = body.get("event", {})
         header = body.get("header", {})
 
-        # Lark v2 事件格式
         if header.get("event_type") == "im.message.receive_v1":
             return await self._handle_message_event(event)
 
-        # Lark v1 事件格式
         if event_type == "im.message.receive_v1":
             return await self._handle_message_event(event)
 
@@ -114,28 +107,24 @@ class LarkBot:
         return None
 
     async def _handle_message_event(self, event: dict) -> Optional[dict]:
-        """处理收到的用户消息"""
+        """Handle received user message"""
         try:
             message = event.get("message", {})
             sender = event.get("sender", {})
 
-            # 获取消息内容
             msg_type = message.get("message_type", "")
             content_str = message.get("content", "{}")
 
-            # 提取文本内容
             text = self._extract_text(msg_type, content_str)
             if not text:
                 return None
 
-            # 获取发送者信息
             sender_id = (
                 sender.get("sender_id", {}).get("open_id", "")
                 or sender.get("user_id", "")
             )
             chat_id = message.get("chat_id", "")
 
-            # 处理命令
             response = await self._process_command(text.strip(), sender_id)
             if response:
                 await self._send_message(chat_id, response)
@@ -148,15 +137,13 @@ class LarkBot:
     async def _process_command(
         self, text: str, sender_id: str
     ) -> Optional[str]:
-        """解析并执行命令
+        """Parse and execute command
 
-        格式: /命令 [参数...]
+        Format: /command [args...]
         """
-        # 去掉 / 前缀
         if not text.startswith("/"):
             return None
 
-        # 解析命令
         parts = shlex.split(text[1:])
         if not parts:
             return COMMAND_HELP
@@ -164,7 +151,6 @@ class LarkBot:
         cmd = parts[0].lower()
         args = parts[1:]
 
-        # 命令分发
         handlers = {
             "list": self._cmd_list,
             "l": self._cmd_list,
@@ -180,18 +166,18 @@ class LarkBot:
 
         handler = handlers.get(cmd)
         if not handler:
-            return f"未知命令: /{cmd}\n{COMMAND_HELP}"
+            return f"Unknown command: /{cmd}\n{COMMAND_HELP}"
 
         return await handler(args)
 
     async def _cmd_list(self, _args: list[str]) -> str:
-        """列出所有 session"""
+        """List all sessions"""
         sessions = self.registry.list()
 
         if not sessions:
-            return "📭 当前没有活跃的 Claude Code session。"
+            return "📭 No active Claude Code sessions."
 
-        lines = ["📋 **Claude Code Session 列表**\n"]
+        lines = ["📋 **Claude Code Session List**\n"]
         for s in sessions:
             status_icon = {
                 "running": "🟢",
@@ -201,12 +187,10 @@ class LarkBot:
                 "error": "❌",
             }.get(s.get("status", ""), "⚪")
 
-            # 会话类型图标
             stype = s.get("session_type", "screen")
             type_icon = {"screen": "💻", "ide": "🔌", "standalone": "💻", "terminal": "💻"}.get(stype, "💻")
-            type_label = {"screen": "独立终端", "ide": "IDE 终端", "standalone": "终端", "terminal": "终端"}.get(stype, "终端")
 
-            sid = s["id"][:8]  # 短 ID
+            sid = s["id"][:8]
             name = s.get("name", "") or sid
             cwd = s.get("cwd", "") or "-"
             created = s.get("created_at", 0)
@@ -215,93 +199,107 @@ class LarkBot:
 
             line = f"{status_icon} {type_icon} `{sid}` — **{name}**\n"
             if stype == "ide":
-                line += f"  · 应用: `{app or '-'}`\n"
+                line += f"  · App: `{app or '-'}`\n"
             else:
-                line += f"  · 目录: `{cwd}`\n"
-            line += f"  · 运行: {elapsed}\n"
+                line += f"  · Dir: `{cwd}`\n"
+            line += f"  · Running: {elapsed}\n"
 
             lines.append(line)
 
-        lines.append(f"\n共 {len(sessions)} 个 session")
-        lines.append("输入 `/status <id>` 查看详情")
-        lines.append("输入 `/help` 查看所有命令")
+        lines.append(f"\n{len(sessions)} session(s) total")
+        lines.append("Use `/status <id>` for details")
+        lines.append("Use `/help` for all commands")
         return "\n".join(lines)
 
     async def _cmd_status(self, args: list[str]) -> str:
-        """查看 session 详情"""
+        """Show session details"""
         if not args:
-            return "用法: `/status <session_id>`\n例: `/status abc12345`"
+            return "Usage: `/status <session_id>`\ne.g. `/status abc12345`"
 
         session_id = self._resolve_id(args[0])
         if not session_id:
-            return f"❌ 未找到 session: `{args[0]}`"
+            return f"❌ Session not found: `{args[0]}`"
 
         s = self.registry.get(session_id)
         if not s:
-            return f"❌ session 已不存在"
+            return f"❌ Session no longer exists"
 
         stype = s.get("session_type", "screen")
         status_icon = {
-            "running": "🟢 运行中",
-            "waiting": "🟡 等待输入",
-            "idle": "⚪ 空闲",
-            "stopped": "🔴 已停止",
-            "error": "❌ 错误",
-        }.get(s.get("status", ""), s.get("status", "未知"))
+            "running": "🟢 Running",
+            "waiting": "🟡 Waiting for input",
+            "idle": "⚪ Idle",
+            "stopped": "🔴 Stopped",
+            "error": "❌ Error",
+        }.get(s.get("status", ""), s.get("status", "Unknown"))
 
         lines = [
-            f"📊 **Session 详情**\n",
+            f"📊 **Session Details**\n",
             f"  · ID: `{session_id[:12]}...`",
-            f"  · 名称: {s.get('name', '-')}",
-            f"  · 状态: {status_icon}",
+            f"  · Name: {s.get('name', '-')}",
+            f"  · Status: {status_icon}",
         ]
         if stype == "ide":
-            lines.append(f"  · 类型: 🔌 IDE 终端 ({s.get('app_name', '-')})")
+            lines.append(f"  · Type: 🔌 IDE Terminal ({s.get('app_name', '-')})")
+        elif stype == "terminal":
+            lines.append(f"  · Type: 💻 Native Terminal")
         else:
-            lines.append(f"  · 类型: 💻 独立终端 (screen)")
-        lines.append(f"  · 目录: `{s.get('cwd', '-')}`")
+            lines.append(f"  · Type: 💻 Screen Session")
+        lines.append(f"  · Dir: `{s.get('cwd', '-')}`")
         lines.append(f"  · PID: {s.get('pid', '-')}")
-        lines.append(f"  · 创建: {self._format_elapsed(s.get('created_at', 0))}前")
+        lines.append(f"  · Created: {self._format_elapsed(s.get('created_at', 0))} ago")
 
-        # 获取最新输出
-        if stype == "screen":
+        if stype == "ide":
+            app_name = s.get("app_name", "")
+            output, line_count = self.ide_ctrl.read_output(app_name, 15)
+            if output:
+                lines.append(f"\n📄 **Latest Output** ({line_count} lines):")
+                lines.append(f"```\n{output[-500:]}\n```")
+            else:
+                lines.append("\n📄 Could not read IDE terminal output.")
+                lines.append("   Please ensure Accessibility permission is granted.")
+        elif stype == "screen":
             output, line_count = await self.screen_mgr.read_output(session_id, 15)
             if output:
-                lines.append(f"\n📄 **最新输出** ({line_count} 行):")
+                lines.append(f"\n📄 **Latest Output** ({line_count} lines):")
                 lines.append(f"```\n{output[-500:]}\n```")
         else:
-            lines.append("\n📄 IDE 终端的输出无法自动读取，")
-            lines.append("   请直接查看 IDE 中的终端窗口。")
+            output, line_count = await self.screen_mgr.read_output(session_id, 15)
+            if output:
+                lines.append(f"\n📄 **Latest Output** ({line_count} lines):")
+                lines.append(f"```\n{output[-500:]}\n```")
 
-        # 操作提示
         if s.get("status") in ("waiting", "running", "idle"):
             lines.append(
-                "\n💡 可执行操作:\n"
-                f"  · `/confirm {session_id[:8]}` — 确认\n"
-                f"  · `/send {session_id[:8]} <命令>` — 发送命令\n"
-                f"  · `/interrupt {session_id[:8]}` — 中断\n"
-                f"  · `/stop {session_id[:8]}` — 停止"
+                "\n💡 Available actions:\n"
+                f"  · `/confirm {session_id[:8]}` — Confirm (Enter)\n"
+                f"  · `/send {session_id[:8]} <command>` — Send command\n"
+                f"  · `/interrupt {session_id[:8]}` — Ctrl+C\n"
+                f"  · `/stop {session_id[:8]}` — Stop"
             )
 
         return "\n".join(lines)
 
     async def _cmd_send(self, args: list[str]) -> str:
-        """发送命令到 session"""
+        """Send command to session"""
         if len(args) < 2:
-            return "用法: `/send <session_id> <text>`\n例: `/send abc12345 python train.py`"
+            return "Usage: `/send <session_id> <text>`\ne.g. `/send abc12345 python train.py`"
 
         session_id = self._resolve_id(args[0])
         if not session_id:
-            return f"❌ 未找到 session: `{args[0]}`"
+            return f"❌ Session not found: `{args[0]}`"
 
         text = " ".join(args[1:])
         s = self.registry.get(session_id)
         if not s:
-            return f"❌ session 已不存在"
+            return f"❌ Session no longer exists"
 
         stype = s.get("session_type", "screen")
         if stype == "ide":
             app = s.get("app_name", "")
+            ok = self.ide_ctrl.send_keys(app, text)
+        elif stype == "terminal":
+            app = s.get("app_name") or "Terminal"
             ok = self.ide_ctrl.send_keys(app, text)
         else:
             ok = await self.screen_mgr.send_keys(session_id, text)
@@ -309,56 +307,59 @@ class LarkBot:
         if ok:
             self.registry.update(session_id, status="running")
             type_tag = "🔌 IDE" if stype == "ide" else "💻"
-            return f"✅ {type_tag} 已发送命令到 `{session_id[:8]}...`:\n```\n$ {text}\n```"
+            return f"✅ {type_tag} Sent command to `{session_id[:8]}...`:\n```\n$ {text}\n```"
         else:
-            return f"❌ 发送失败，session 可能已停止"
+            return f"❌ Send failed, session may be stopped"
 
     async def _cmd_confirm(self, args: list[str]) -> str:
-        """确认操作（回车）"""
+        """Confirm operation (Enter)"""
         if not args:
-            return "用法: `/confirm <session_id>`"
+            return "Usage: `/confirm <session_id>`"
 
         session_id = self._resolve_id(args[0])
         if not session_id:
-            return f"❌ 未找到 session: `{args[0]}`"
+            return f"❌ Session not found: `{args[0]}`"
 
         s = self.registry.get(session_id)
         if not s:
-            return f"❌ session 已不存在"
+            return f"❌ Session no longer exists"
 
         stype = s.get("session_type", "screen")
         if stype == "ide":
             ok = self.ide_ctrl.send_enter(s.get("app_name", ""))
+        elif stype == "terminal":
+            app = s.get("app_name") or "Terminal"
+            ok = self.ide_ctrl.send_enter(app)
         else:
             ok = await self.screen_mgr.send_enter(session_id)
 
         if ok:
             self.registry.update(session_id, status="running")
-            return f"✅ 已确认 `{session_id[:8]}...`"
+            return f"✅ Confirmed `{session_id[:8]}...`"
         else:
-            return f"❌ 操作失败，session 可能已停止"
+            return f"❌ Operation failed, session may be stopped"
 
     async def _cmd_select(self, args: list[str]) -> str:
-        """选择选项"""
+        """Select option"""
         if len(args) < 2:
-            return "用法: `/select <session_id> <数字>`\n例: `/select abc12345 2`"
+            return "Usage: `/select <session_id> <number>`\ne.g. `/select abc12345 2`"
 
         session_id = self._resolve_id(args[0])
         if not session_id:
-            return f"❌ 未找到 session: `{args[0]}`"
+            return f"❌ Session not found: `{args[0]}`"
 
         try:
             option = int(args[1])
         except ValueError:
-            return "❌ 选项必须为数字"
+            return "❌ Option must be a number"
 
         s = self.registry.get(session_id)
         if not s:
-            return f"❌ session 已不存在"
+            return f"❌ Session no longer exists"
 
         stype = s.get("session_type", "screen")
-        if stype == "ide":
-            app = s.get("app_name", "")
+        if stype in ("ide", "terminal"):
+            app = s.get("app_name") or ("Terminal" if stype == "terminal" else "")
             ok = self.ide_ctrl.send_text(app, str(option))
             if ok:
                 self.ide_ctrl.send_enter(app)
@@ -367,51 +368,54 @@ class LarkBot:
 
         if ok:
             self.registry.update(session_id, status="running")
-            return f"✅ 已选择选项 {option} → `{session_id[:8]}...`"
+            return f"✅ Selected option {option} → `{session_id[:8]}...`"
         else:
-            return f"❌ 操作失败，session 可能已停止"
+            return f"❌ Operation failed, session may be stopped"
 
     async def _cmd_interrupt(self, args: list[str]) -> str:
-        """中断（Ctrl+C）"""
+        """Send Ctrl+C"""
         if not args:
-            return "用法: `/interrupt <session_id>`"
+            return "Usage: `/interrupt <session_id>`"
 
         session_id = self._resolve_id(args[0])
         if not session_id:
-            return f"❌ 未找到 session: `{args[0]}`"
+            return f"❌ Session not found: `{args[0]}`"
 
         s = self.registry.get(session_id)
         if not s:
-            return f"❌ session 已不存在"
+            return f"❌ Session no longer exists"
 
         stype = s.get("session_type", "screen")
         if stype == "ide":
             ok = self.ide_ctrl.send_ctrl_c(s.get("app_name", ""))
+        elif stype == "terminal":
+            app = s.get("app_name") or "Terminal"
+            ok = self.ide_ctrl.send_ctrl_c(app)
         else:
             ok = await self.screen_mgr.send_ctrl_c(session_id)
 
         if ok:
             self.registry.update(session_id, status="running")
-            return f"⚠️ 已发送中断信号到 `{session_id[:8]}...`"
+            return f"⚠️ Sent interrupt to `{session_id[:8]}...`"
         else:
-            return f"❌ 操作失败，session 可能已停止"
+            return f"❌ Operation failed, session may be stopped"
 
     async def _cmd_stop(self, args: list[str]) -> str:
-        """停止 session"""
+        """Stop session"""
         if not args:
-            return "用法: `/stop <session_id>`"
+            return "Usage: `/stop <session_id>`"
 
         session_id = self._resolve_id(args[0])
         if not session_id:
-            return f"❌ 未找到 session: `{args[0]}`"
+            return f"❌ Session not found: `{args[0]}`"
 
         s = self.registry.get(session_id)
         if not s:
-            return f"❌ session 已不存在"
+            return f"❌ Session no longer exists"
 
         stype = s.get("session_type", "screen")
-        if stype == "ide":
-            app = s.get("app_name", "")
+        if stype in ("ide", "terminal"):
+            app = s.get("app_name") or ("Terminal" if stype == "terminal" else "")
             self.ide_ctrl.send_ctrl_c(app)
         else:
             await self.screen_mgr.send_ctrl_c(session_id)
@@ -421,17 +425,14 @@ class LarkBot:
             await self.screen_mgr.kill(session_id)
 
         self.registry.update(session_id, status="stopped")
-        return f"⏹️ 已停止 session `{session_id[:8]}...`"
+        return f"⏹️ Stopped session `{session_id[:8]}...`"
 
     async def _cmd_help(self, _args: list[str]) -> str:
-        """显示帮助"""
+        """Show help"""
         return COMMAND_HELP
 
     async def _send_message(self, chat_id: str, text: str) -> bool:
-        """通过 lark-cli 发送消息
-
-        使用 lark-cli im send 命令发送文本消息。
-        """
+        """Send message via lark-cli"""
         if not chat_id:
             logger.warning("No chat_id for sending message")
             return False
@@ -461,15 +462,11 @@ class LarkBot:
             return False
 
     async def _reply_message(self, chat_id: str, message_id: str, text: str) -> bool:
-        """回复消息（使用消息 ID 回复，创建线程）
-
-        使用 lark-cli im reply 命令。
-        """
+        """Reply to a message (creates thread)"""
         if not chat_id or not message_id:
             return await self._send_message(chat_id, text)
 
         try:
-            # 使用 --text 参数简化回复
             proc = await asyncio.create_subprocess_exec(
                 "lark-cli", "im", "+messages-reply",
                 "--message-id", message_id,
@@ -492,7 +489,7 @@ class LarkBot:
             return False
 
     def _resolve_id(self, short_id: str) -> Optional[str]:
-        """将短 ID（前 8 位）解析为完整 session ID"""
+        """Resolve short ID (first 8 chars) to full session ID"""
         sessions = self.registry.list()
         for s in sessions:
             if s["id"].startswith(short_id):
@@ -501,7 +498,7 @@ class LarkBot:
 
     @staticmethod
     def _extract_text(msg_type: str, content_str: str) -> Optional[str]:
-        """从消息 content 中提取文本"""
+        """Extract text from message content"""
         try:
             content = json.loads(content_str) if isinstance(content_str, str) else content_str
         except json.JSONDecodeError:
@@ -513,18 +510,18 @@ class LarkBot:
 
     @staticmethod
     def _format_elapsed(timestamp: float) -> str:
-        """格式化运行时长"""
+        """Format elapsed time"""
         import time
         seconds = time.time() - timestamp
         if seconds < 60:
-            return f"{int(seconds)}秒"
+            return f"{int(seconds)}s"
         elif seconds < 3600:
-            return f"{int(seconds // 60)}分"
+            return f"{int(seconds // 60)}m"
         elif seconds < 86400:
             h = int(seconds // 3600)
             m = int((seconds % 3600) // 60)
-            return f"{h}时{m}分"
+            return f"{h}h{m}m"
         else:
             d = int(seconds // 86400)
             h = int((seconds % 86400) // 3600)
-            return f"{d}天{h}时"
+            return f"{d}d{h}h"

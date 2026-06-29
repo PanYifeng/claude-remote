@@ -1,15 +1,32 @@
 #!/usr/bin/env python3
-"""Claude Code Shell 远程控制 Daemon
+"""Claude Code Remote Control Daemon
 
-集成了：
-- aiohttp HTTP API 服务器
-- Session 注册表（SQLite 持久化）
-- Screen 会话管理
-- Lark 机器人 webhook 处理器
-- 定时健康检查
+Integrates:
+- aiohttp HTTP API server
+- Session registry (SQLite persistence)
+- Screen session management
+- Lark bot webhook handler
+- Periodic health check
 
-启动: python3 daemon.py
+Usage: python3 daemon.py
 """
+
+import asyncio
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from typing import Optional
+
+from aiohttp import web
+
+from config import config
+from lark_bot import LarkBot
+from registry import SessionRegistry
+from screen_manager import ScreenManager
+from ide_control import ide_control
 
 import asyncio
 import json
@@ -200,23 +217,17 @@ class Daemon:
         return session.get("app_name") or session.get("win_title", "")
 
     async def _send_cmd(self, session: dict, text: str) -> bool:
-        """根据 session_type 选择发送方式
-
-        Args:
-            session: session 完整记录
-            text: 要发送的命令（自动加回车）
-
-        Returns:
-            是否成功发送
-        """
+        """Dispatch send command based on session type"""
         stype = session.get("session_type", "screen")
         if stype == "ide":
             app = self._get_app_name(session)
             return self.ide_ctrl.send_keys(app, text)
+        elif stype in ("terminal",):
+            app = session.get("app_name") or "Terminal"
+            return self.ide_ctrl.send_keys(app, text)
         elif stype == "screen":
             return await self.screen_mgr.send_keys(session["id"], text)
         else:
-            # standalone: 尝试 screen 命令；失败则尝试 AppleScript
             ok = await self.screen_mgr.send_keys(session["id"], text)
             if ok:
                 return True
@@ -226,10 +237,13 @@ class Daemon:
             return False
 
     async def _confirm_cmd(self, session: dict) -> bool:
-        """发送回车确认"""
+        """Send Enter confirmation"""
         stype = session.get("session_type", "screen")
         if stype == "ide":
             app = self._get_app_name(session)
+            return self.ide_ctrl.send_enter(app)
+        elif stype in ("terminal",):
+            app = session.get("app_name") or "Terminal"
             return self.ide_ctrl.send_enter(app)
         elif stype == "screen":
             return await self.screen_mgr.send_enter(session["id"])
@@ -243,10 +257,13 @@ class Daemon:
             return False
 
     async def _interrupt_cmd(self, session: dict) -> bool:
-        """发送 Ctrl+C"""
+        """Send Ctrl+C"""
         stype = session.get("session_type", "screen")
         if stype == "ide":
             app = self._get_app_name(session)
+            return self.ide_ctrl.send_ctrl_c(app)
+        elif stype in ("terminal",):
+            app = session.get("app_name") or "Terminal"
             return self.ide_ctrl.send_ctrl_c(app)
         elif stype == "screen":
             return await self.screen_mgr.send_ctrl_c(session["id"])
@@ -260,10 +277,10 @@ class Daemon:
             return False
 
     async def _select_cmd(self, session: dict, option: int) -> bool:
-        """选择选项"""
+        """Select an option number"""
         stype = session.get("session_type", "screen")
-        if stype == "ide":
-            app = self._get_app_name(session)
+        if stype in ("ide", "terminal"):
+            app = session.get("app_name") or ("Terminal" if stype == "terminal" else self._get_app_name(session))
             ok = self.ide_ctrl.send_text(app, str(option))
             if ok:
                 self.ide_ctrl.send_enter(app)
@@ -272,10 +289,10 @@ class Daemon:
             return await self.screen_mgr.select_option(session["id"], option)
 
     async def _stop_cmd(self, session: dict) -> bool:
-        """停止 session"""
+        """Stop a session"""
         stype = session.get("session_type", "screen")
-        if stype == "ide":
-            app = self._get_app_name(session)
+        if stype in ("ide", "terminal"):
+            app = session.get("app_name") or ("Terminal" if stype == "terminal" else self._get_app_name(session))
             self.ide_ctrl.send_ctrl_c(app)
             return True
         else:
@@ -305,14 +322,21 @@ class Daemon:
             return self._json({"error": "session 不存在"}, status=404)
 
         stype = session.get("session_type", "screen")
+        app_name = session.get("app_name", "")
 
         if stype == "ide":
-            # IDE session: 无法读取 log 文件，返回进程信息
-            session["live_output"] = "(IDE 终端，无法自动读取输出)"
-            session["live_line_count"] = 0
+            # IDE session: 通过 Accessibility API 全选→复制读取终端内容
+            try:
+                output, line_count = self.ide_ctrl.read_output(app_name, 50)
+                session["live_output"] = output
+                session["live_line_count"] = line_count
+            except Exception as e:
+                logger.warning("Failed to read IDE terminal output: %s", e)
+                session["live_output"] = ""
+                session["live_line_count"] = 0
             session["detected_status"] = session.get("status", "running")
         else:
-            # Screen session: 读取 log 尾部
+            # Screen/terminal session: 读取 log 尾部
             output, line_count = await self.screen_mgr.read_output(session_id, 50)
             session["live_output"] = output
             session["live_line_count"] = line_count
@@ -468,7 +492,7 @@ class Daemon:
             await asyncio.sleep(config.health_check_interval)
 
     async def _run_health_check(self) -> None:
-        """执行单次健康检查"""
+        """Run a single health check cycle"""
         sessions = self.registry.list(status_filter="running")
         sessions += self.registry.list(status_filter="waiting")
         sessions += self.registry.list(status_filter="idle")
@@ -479,13 +503,13 @@ class Daemon:
             session_id = s["id"]
             stype = s.get("session_type", "screen")
 
-            # 非 screen 类型（ide、standalone）使用心跳超时检测
-            if stype in ("ide", "standalone"):
+            # For all non-screen types (ide, terminal, standalone),
+            # check process health via kill -0 and detect waiting state
+            if stype in ("ide", "terminal", "standalone"):
                 updated_at = s.get("updated_at", 0)
-                elapsed = now - updated_at
-                # 检查进程本身是否还活着
+                elaped = now - updated_at
                 pid = s.get("pid", 0)
-                alive = True
+                liv = True
                 if pid:
                     try:
                         proc = await asyncio.create_subprocess_exec(
@@ -494,23 +518,56 @@ class Daemon:
                             stderr=asyncio.subprocess.DEVNULL,
                         )
                         await proc.wait()
-                        alive = proc.returncode == 0
+                        liv = proc.returncode == 0
                     except Exception:
-                        alive = False
+                        liv = False
 
-                if not alive or elapsed > 60:
+                if not liv:
                     self.registry.update(session_id, status="stopped")
-                    reason = "process dead" if not alive else f"no heartbeat for {elapsed:.0f}s"
                     logger.info(
-                        "Session %s stopped (%s)",
-                        session_id[:8], reason,
+                        "Session %s stopped (process dead)", session_id[:8]
                     )
+                    continue
+
+                # Only mark as stopped if no heartbeat for very long (>120s)
+                # This lets the heartbeat daemon keep it alive
+                if elaped > 120 and not pid:
+                    self.registry.update(session_id, status="stopped")
+                    logger.info(
+                        "Session %s stopped (no heartbeat for %.0fs)",
+                        session_id[:8], elaped,
+                    )
+                    continue
+
+                # For terminal sessions: read log output and detect waiting state
+                if stype == "terminal":
+                    output, _ = await self.screen_mgr.read_output(session_id, 10)
+                    if output:
+                        self.registry.update(
+                            session_id,
+                            last_output=output[-300:] if len(output) > 300 else output,
+                        )
+                        status = await self.screen_mgr.detect_status(
+                            session_id, pid=pid, last_update=updated_at,
+                        )
+                        if status != s.get("status"):
+                            logger.info(
+                                "Session %s status: %s -> %s",
+                                session_id[:8], s.get("status"), status,
+                            )
+                            self.registry.update(session_id, status=status)
+                    # Also save the updated_at so scan-existing heartbeat refreshes it
+                    self.registry.update(session_id, updated_at=now)
+                else:
+                    # ide/standalone: just keep alive via heartbeat freshness
+                    self.registry.update(session_id, updated_at=now)
+
                 continue
 
-            # Screen session: 检查 screen 存活
-            alive = await self.screen_mgr.is_alive(session_id)
+            # Screen session: check screen alive
+            liv = await self.screen_mgr.is_alive(session_id)
 
-            if not alive:
+            if not liv:
                 self.registry.update(session_id, status="stopped")
                 logger.info(
                     "Session %s stopped (screen no longer alive)",
@@ -518,10 +575,8 @@ class Daemon:
                 )
                 continue
 
-            # 读取最新输出
+            # Read latest output and detect status
             output, _ = await self.screen_mgr.read_output(session_id, 10)
-
-            # 检测状态
             status = await self.screen_mgr.detect_status(
                 session_id,
                 pid=s.get("pid"),
