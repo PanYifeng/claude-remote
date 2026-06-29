@@ -26,6 +26,9 @@ COMMAND_HELP = """
 /status <id>                  — Show session details
 /send <id> <text>             — Send command to session
 /confirm <id>                 — Confirm operation (Enter)
+/pending                      — List sessions waiting for input
+/waiting                      — Same as /pending
+/confirm-all                  — Confirm all waiting sessions at once
 /select <id> <n>              — Select option N
 /interrupt <id>               — Send Ctrl+C
 /stop <id>                    — Stop session
@@ -158,6 +161,9 @@ class LarkBot:
             "status": self._cmd_status,
             "send": self._cmd_send,
             "confirm": self._cmd_confirm,
+            "pending": self._cmd_pending,
+            "waiting": self._cmd_pending,
+            "confirm-all": self._cmd_confirm_all,
             "select": self._cmd_select,
             "interrupt": self._cmd_interrupt,
             "stop": self._cmd_stop,
@@ -430,6 +436,73 @@ class LarkBot:
     async def _cmd_help(self, _args: list[str]) -> str:
         """Show help"""
         return COMMAND_HELP
+
+    async def _cmd_pending(self, _args: list[str]) -> str:
+        """List all sessions waiting for input"""
+        sessions = self.registry.list(status_filter="waiting")
+
+        if not sessions:
+            return "✅ No sessions waiting for input."
+
+        lines = ["🟡 **Sessions Waiting for Input**\n"]
+        for s in sessions:
+            sid = s["id"][:8]
+            name = s.get("name", "") or sid
+            stype = s.get("session_type", "screen")
+            icon = {"screen": "💻", "ide": "🔌", "standalone": "💻", "terminal": "💻"}.get(stype, "💻")
+            created = s.get("created_at", 0)
+            elapsed = self._format_elapsed(created)
+
+            lines.append(
+                f"{icon} `{sid}` — **{name}**\n"
+                f"  · Running: {elapsed}\n"
+            )
+
+        lines.append(f"\n{len(sessions)} session(s) waiting")
+        lines.append("Use `/confirm-all` to confirm all at once")
+        lines.append("or `/confirm <id>` individually")
+        return "\n".join(lines)
+
+    async def _cmd_confirm_all(self, _args: list[str]) -> str:
+        """Confirm (Enter) all waiting sessions"""
+        sessions = self.registry.list(status_filter="waiting")
+
+        if not sessions:
+            return "✅ No sessions waiting for input."
+
+        success = 0
+        failed = 0
+
+        for s in sessions:
+            ok = await self._confirm_from_bot(s)
+            if ok:
+                success += 1
+            else:
+                failed += 1
+
+        parts = []
+        if success:
+            parts.append(f"✅ Confirmed {success}")
+        if failed:
+            parts.append(f"❌ Failed {failed}")
+        return " — ".join(parts)
+
+    async def _confirm_from_bot(self, s: dict) -> bool:
+        """Send Enter to a session (used from bot commands)"""
+        session_id = s["id"]
+        stype = s.get("session_type", "screen")
+
+        if stype == "ide":
+            ok = self.ide_ctrl.send_enter(s.get("app_name", ""))
+        elif stype == "terminal":
+            app = s.get("app_name") or "Terminal"
+            ok = self.ide_ctrl.send_enter(app)
+        else:
+            ok = await self.screen_mgr.send_enter(session_id)
+
+        if ok:
+            self.registry.update(session_id, status="running")
+        return ok
 
     async def _send_message(self, chat_id: str, text: str) -> bool:
         """Send message via lark-cli"""
