@@ -27,7 +27,6 @@ COMMAND_HELP = """
 /send <id> <text>             — Send command to session
 /confirm <id>                 — Confirm operation (Enter)
 /pending                      — List sessions waiting for input
-/waiting                      — Same as /pending
 /confirm-all                  — Confirm all waiting sessions at once
 /select <id> <n>              — Select option N
 /interrupt <id>               — Send Ctrl+C
@@ -162,7 +161,6 @@ class LarkBot:
             "send": self._cmd_send,
             "confirm": self._cmd_confirm,
             "pending": self._cmd_pending,
-            "waiting": self._cmd_pending,
             "confirm-all": self._cmd_confirm_all,
             "select": self._cmd_select,
             "interrupt": self._cmd_interrupt,
