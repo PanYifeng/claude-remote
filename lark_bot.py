@@ -262,8 +262,11 @@ class LarkBot:
             else:
                 lines.append("\n📄 Could not read IDE terminal output.")
                 lines.append("   Please ensure Accessibility permission is granted.")
-        elif stype == "screen":
+        elif stype == "terminal":
+            # Try log file first, then Terminal.app content
             output, line_count = await self.screen_mgr.read_output(session_id, 15)
+            if not output:
+                output, line_count = self.ide_ctrl.read_terminal_output(15)
             if output:
                 lines.append(f"\n📄 **Latest Output** ({line_count} lines):")
                 lines.append(f"```\n{output[-500:]}\n```")

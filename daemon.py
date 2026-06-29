@@ -539,24 +539,56 @@ class Daemon:
                     )
                     continue
 
-                # For terminal sessions: read log output and detect waiting state
+                # For terminal sessions: try log file first, then AppleScript Terminal reading
                 if stype == "terminal":
                     output, _ = await self.screen_mgr.read_output(session_id, 10)
+
+                    # If log file doesn't exist (session not started via lcc),
+                    # read Terminal window content directly via AppleScript
+                    if not output:
+                        try:
+                            output, _ = self.ide_ctrl.read_terminal_output(15)
+                        except Exception:
+                            pass
+
                     if output:
                         self.registry.update(
                             session_id,
                             last_output=output[-300:] if len(output) > 300 else output,
                         )
-                        status = await self.screen_mgr.detect_status(
-                            session_id, pid=pid, last_update=updated_at,
+
+                    log_status = ScreenManager._looks_waiting(output) if output else False
+                    if log_status:
+                        status = "waiting"
+                    elif not output:
+                        status = "running"
+                    else:
+                        if pid:
+                            try:
+                                proc = await asyncio.create_subprocess_exec(
+                                    "ps", "-p", str(pid), "-o", "state=",
+                                    stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.DEVNULL,
+                                )
+                                stdout, _ = await proc.communicate()
+                                state = stdout.decode().strip()
+                                if state == "S":
+                                    status = "idle"
+                                elif state in ("R", "D"):
+                                    status = "running"
+                                else:
+                                    status = "running"
+                            except Exception:
+                                status = "running"
+                        else:
+                            status = "running"
+
+                    if status != s.get("status"):
+                        logger.info(
+                            "Session %s status: %s -> %s",
+                            session_id[:8], s.get("status"), status,
                         )
-                        if status != s.get("status"):
-                            logger.info(
-                                "Session %s status: %s -> %s",
-                                session_id[:8], s.get("status"), status,
-                            )
-                            self.registry.update(session_id, status=status)
-                    # Also save the updated_at so scan-existing heartbeat refreshes it
+                        self.registry.update(session_id, status=status)
                     self.registry.update(session_id, updated_at=now)
                 else:
                     # ide/standalone: just keep alive via heartbeat freshness

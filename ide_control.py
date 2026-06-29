@@ -217,6 +217,73 @@ class IDEControl:
         except Exception:
             return False
 
+    def read_terminal_output(self, lines: int = 50) -> tuple[str, int]:
+        """Read macOS Terminal.app content directly via AppleScript
+
+        Unlike read_output() for IDEs, this reads the Terminal session
+        content directly without touching the clipboard.
+
+        Args:
+            lines: Number of tail lines to return
+
+        Returns:
+            (output_text, line_count)
+        """
+        script = """
+        tell application "Terminal"
+            try
+                set allContent to contents of selected tab of front window
+                return allContent
+            on error
+                return ""
+            end try
+        end tell
+        """
+        try:
+            # Try Terminal.app first
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=5,
+            )
+            text = result.stdout.strip()
+            if text:
+                line_count = len(text.splitlines())
+                if line_count > lines:
+                    text = "\n".join(text.splitlines()[-lines:])
+                    line_count = lines
+                return text, line_count
+        except Exception:
+            pass
+
+        # Fallback: try iTerm2
+        script = """
+        tell application "iTerm2"
+            try
+                tell current session of current window
+                    get contents
+                end tell
+            on error
+                return ""
+            end try
+        end tell
+        """
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=5,
+            )
+            text = result.stdout.strip()
+            if text:
+                line_count = len(text.splitlines())
+                if line_count > lines:
+                    text = "\n".join(text.splitlines()[-lines:])
+                    line_count = lines
+                return text, line_count
+        except Exception:
+            pass
+
+        return "", 0
+
     def read_output(self, app_name: str, lines: int = 50) -> tuple[str, int]:
         """Read IDE terminal output via Select All → Copy → Clipboard
 
