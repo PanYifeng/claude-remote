@@ -4,3 +4,12 @@ data/
 screenlog.*
 *.log
 .DS_Store
+
+# Runtime data
+sessions.db
+sessions.db-wal
+sessions.db-shm
+data/
+
+# macOS
+.DS_Store

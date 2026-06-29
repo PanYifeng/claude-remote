@@ -77,6 +77,7 @@ class Daemon:
         # 运行状态
         self._running = True
         self._health_task: Optional[asyncio.Task] = None
+        self._event_task: Optional[asyncio.Task] = None
         self._session_write_locks: dict[str, asyncio.Lock] = {}
 
     # ── HTTP 路由 ────────────────────────────────────────────
@@ -160,7 +161,7 @@ class Daemon:
     async def handle_session_heartbeat(
         self, request: web.Request
     ) -> web.Response:
-        """Session 心跳（由 lcc wrapper 定期调用）"""
+        """Session 心跳（由 lcc wrapper 或 scan-existing 定期调用）"""
         session_id = request.match_info["session_id"]
 
         try:
@@ -174,6 +175,9 @@ class Daemon:
             update["pid"] = data["pid"]
         if data.get("output") is not None:
             update["last_output"] = data["output"]
+        if data.get("status"):
+            # 允许通过心跳恢复 session 状态
+            update["status"] = data["status"]
 
         session = self.registry.update(session_id, **update)
         if not session:
@@ -209,8 +213,17 @@ class Daemon:
         if stype == "ide":
             app = self._get_app_name(session)
             return self.ide_ctrl.send_keys(app, text)
-        else:
+        elif stype == "screen":
             return await self.screen_mgr.send_keys(session["id"], text)
+        else:
+            # standalone: 尝试 screen 命令；失败则尝试 AppleScript
+            ok = await self.screen_mgr.send_keys(session["id"], text)
+            if ok:
+                return True
+            app = self._get_app_name(session)
+            if app:
+                return self.ide_ctrl.send_keys(app, text)
+            return False
 
     async def _confirm_cmd(self, session: dict) -> bool:
         """发送回车确认"""
@@ -218,8 +231,16 @@ class Daemon:
         if stype == "ide":
             app = self._get_app_name(session)
             return self.ide_ctrl.send_enter(app)
-        else:
+        elif stype == "screen":
             return await self.screen_mgr.send_enter(session["id"])
+        else:
+            ok = await self.screen_mgr.send_enter(session["id"])
+            if ok:
+                return True
+            app = self._get_app_name(session)
+            if app:
+                return self.ide_ctrl.send_enter(app)
+            return False
 
     async def _interrupt_cmd(self, session: dict) -> bool:
         """发送 Ctrl+C"""
@@ -227,8 +248,16 @@ class Daemon:
         if stype == "ide":
             app = self._get_app_name(session)
             return self.ide_ctrl.send_ctrl_c(app)
-        else:
+        elif stype == "screen":
             return await self.screen_mgr.send_ctrl_c(session["id"])
+        else:
+            ok = await self.screen_mgr.send_ctrl_c(session["id"])
+            if ok:
+                return True
+            app = self._get_app_name(session)
+            if app:
+                return self.ide_ctrl.send_ctrl_c(app)
+            return False
 
     async def _select_cmd(self, session: dict, option: int) -> bool:
         """选择选项"""
@@ -450,16 +479,31 @@ class Daemon:
             session_id = s["id"]
             stype = s.get("session_type", "screen")
 
-            if stype == "ide":
-                # IDE session 健康检查：确认心跳未超时
+            # 非 screen 类型（ide、standalone）使用心跳超时检测
+            if stype in ("ide", "standalone"):
                 updated_at = s.get("updated_at", 0)
                 elapsed = now - updated_at
-                if elapsed > 30:
-                    # 超过 30 秒无心跳 → 标记为 stopped
+                # 检查进程本身是否还活着
+                pid = s.get("pid", 0)
+                alive = True
+                if pid:
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "kill", "-0", str(pid),
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await proc.wait()
+                        alive = proc.returncode == 0
+                    except Exception:
+                        alive = False
+
+                if not alive or elapsed > 60:
                     self.registry.update(session_id, status="stopped")
+                    reason = "process dead" if not alive else f"no heartbeat for {elapsed:.0f}s"
                     logger.info(
-                        "IDE session %s stopped (no heartbeat for %.0fs)",
-                        session_id[:8], elapsed,
+                        "Session %s stopped (%s)",
+                        session_id[:8], reason,
                     )
                 continue
 
@@ -490,6 +534,68 @@ class Daemon:
             )
 
     # ── 启动 / 关闭 ────────────────────────────────────────
+    async def event_consume_loop(self) -> None:
+        """通过 lark-cli event consume 实时接收飞书消息
+
+        替代 webhook 方案，使用长连接事件消费模式。
+        lark-cli event consume 输出说明：
+        - stderr: [event] 日志 + NDJSON 格式的消息事件
+        - stdout: 通常为空
+        - 必须保持 stdin 打开，否则 consume 进程立即退出
+        """
+        logger.info("Starting Lark event consume loop...")
+
+        while self._running:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "lark-cli", "event", "consume",
+                    "im.message.receive_v1",
+                    "--as", "bot",
+                    "--timeout", "0",  # 无限等待
+                    stdin=asyncio.subprocess.PIPE,  # 必须保持打开，否则 consume 因 stdin EOF 退出
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+
+                logger.info("Lark event consume started (PID: %d)", proc.pid)
+
+                # 事件输出到 stdout（NDJSON），[event] 日志在 stderr
+                assert proc.stdout is not None
+                while self._running and proc.returncode is None:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=600
+                    )
+                    if not line:
+                        break
+
+                    raw = line.decode("utf-8", errors="replace").strip()
+                    if not raw:
+                        continue
+
+                    # 尝试解析 JSON — 消息事件
+                    try:
+                        event_data = json.loads(raw)
+                        await self.lark_bot.handle_event_line(event_data)
+                    except json.JSONDecodeError:
+                        logger.debug("Skipping non-JSON: %s", raw[:80])
+                    except Exception as e:
+                        logger.error("Error handling event: %s", e)
+                # 如果进程正常退出，等待退出码
+                await proc.wait()
+                logger.warning(
+                    "Lark event consume exited (code: %d), restarting in 3s...",
+                    proc.returncode,
+                )
+
+            except asyncio.TimeoutError:
+                # 超时重置（keepalive 信号）
+                continue
+            except Exception as e:
+                logger.error("Lark event consume error: %s", e)
+
+            # 重启前等待
+            await asyncio.sleep(3)
+
     async def start(self) -> None:
         """启动 daemon"""
         self._start_time = time.time()
@@ -512,6 +618,9 @@ class Daemon:
         site = web.TCPSite(runner, "127.0.0.1", config.daemon_port)
         await site.start()
 
+        # 启动事件消费（替代 webhook）
+        self._event_task = asyncio.create_task(self.event_consume_loop(), name="lark-event")
+
         logger.info(
             "Daemon started on http://127.0.0.1:%d",
             config.daemon_port,
@@ -525,6 +634,8 @@ class Daemon:
             self._running = False
             if self._health_task:
                 self._health_task.cancel()
+            if self._event_task:
+                self._event_task.cancel()
 
     # ── 工具方法 ──────────────────────────────────────────
     async def _with_lock(

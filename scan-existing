@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""扫描已有 claude 进程并注册到 daemon
+
+功能：
+1. 查找所有运行中的 claude 进程（非 daemon 自身）
+2. 判断每个进程的类型：
+   - terminal: 通过 screen/TTY 运行的独立终端
+   - ide: IntelliJ/PyCharm/Code 等 IDE 进程的子进程
+3. 注册到 daemon（如果尚未注册）
+4. 启动心跳守护，保持 session 活跃
+
+用法：
+  python3 scan-existing                  # 扫描并注册一次
+  python3 scan-existing --daemon         # 注册后持续心跳守护
+  python3 scan-existing --daemon --interval 5  # 每5秒心跳（默认）
+
+输出格式（JSON Lines）：
+  {"type":"found","pid":12345,"kind":"terminal","session_id":"xxx"}
+  {"type":"registered","session_id":"xxx","name":"终端名称"}
+"""
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+DAEMON_URL = os.getenv("CCR_DAEMON_URL", "http://localhost:9998")
+try:
+    CLAUDE_REMOTE_DIR = Path(__file__).parent.resolve()
+except NameError:
+    CLAUDE_REMOTE_DIR = Path(os.path.dirname(os.path.abspath(sys.argv[0])))
+
+
+def find_claude_processes() -> list[dict]:
+    """查找所有运行中的 claude 进程
+
+    只匹配真正的 claude 二进制进程，不匹配包含 claude 关键词的 shell 命令。
+
+    Returns:
+        [{"pid": int, "tty": str, "cmd": str, "cwd": str}, ...]
+    """
+    processes = []
+    try:
+        # 方式一：通过 ps -e 列出所有进程，用 comm 匹配 claude 二进制
+        result = subprocess.run(
+            ["ps", "-eo", "pid,tty,comm"],
+            capture_output=True, text=True, timeout=5,
+        )
+        claude_pids = set()
+        for line in result.stdout.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid_str, tty, comm = parts
+            # 只匹配真正的 claude 二进制名
+            if comm != "claude":
+                continue
+            try:
+                claude_pids.add(int(pid_str))
+            except ValueError:
+                continue
+
+        if not claude_pids:
+            return []
+
+        # 方式二：获取这些进程的详细信息
+        for pid in sorted(claude_pids):
+            # 获取完整命令行
+            cmd_proc = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True, text=True, timeout=3,
+            )
+            cmd = cmd_proc.stdout.strip()[:80]
+
+            # 获取 TTY
+            tty_proc = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "tty="],
+                capture_output=True, text=True, timeout=3,
+            )
+            tty = tty_proc.stdout.strip()
+
+            # 获取工作目录
+            cwd = ""
+            try:
+                cwd_proc = subprocess.run(
+                    ["lsof", "-p", str(pid), "-Fn", "-a", "-d", "cwd"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                for cl in cwd_proc.stdout.splitlines():
+                    if cl.startswith("n/"):
+                        cwd = cl[1:]
+                        break
+            except Exception:
+                pass
+
+            processes.append({
+                "pid": pid,
+                "tty": tty,
+                "cmd": cmd,
+                "cwd": cwd or os.getcwd(),
+            })
+    except Exception as e:
+        print(f"扫描进程失败: {e}", file=sys.stderr)
+
+    return processes
+
+
+def detect_process_type(proc: dict) -> tuple[str, str]:
+    """检测 claude 进程的类型
+
+    Returns:
+        ("terminal"|"ide", app_name or "")
+    """
+    # 检查父进程链确定类型
+    pid = proc["pid"]
+    seen = set()
+    for _ in range(10):  # 最多向上查10层
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "ppid=,comm="],
+                capture_output=True, text=True, timeout=3,
+            )
+            parts = result.stdout.strip().split(None, 1)
+            if len(parts) < 2:
+                break
+            ppid_str = parts[0]
+            comm = parts[1]
+
+            # IDE 进程名检测
+            ide_map = {
+                "idea": "IntelliJ IDEA",
+                "pycharm": "PyCharm",
+                "webstorm": "WebStorm",
+                "code": "Code",
+                "cursor": "Cursor",
+                "windsurf": "Windsurf",
+                "Terminal": "",  # macOS 原生终端
+                "iTerm2": "",    # iTerm2
+            }
+            comm_lower = comm.lower()
+            for key, name in ide_map.items():
+                if key in comm_lower:
+                    return ("ide", name or comm)
+
+            # 如果是 Terminal/iTerm2 的父进程 → terminal 类型
+            if "Terminal" in comm or "iTerm2" in comm:
+                return ("terminal", "Terminal")
+
+            pid = int(ppid_str)
+            if pid <= 1 or pid in seen:
+                break
+            seen.add(pid)
+        except (ValueError, subprocess.TimeoutExpired):
+            break
+
+    # 有 TTY 的终端进程
+    if proc["tty"] and proc["tty"] != "??":
+        return ("terminal", "")
+
+    return ("standalone", "")
+
+
+def get_name(proc: dict, kind: str, app_name: str) -> str:
+    """生成可读的会话名称"""
+    if app_name:
+        return f"{app_name} — {os.path.basename(proc['cwd']) or '?'}"
+    if proc["tty"]:
+        return f"终端 {proc['tty']} — {os.path.basename(proc['cwd']) or '?'}"
+    return f"Claude (PID {proc['pid']})"
+
+
+def register_session(proc: dict, kind: str, app_name: str) -> str | None:
+    """注册到 daemon
+
+    Returns:
+        session_id 或 None（失败）
+    """
+    session_id = str(uuid.uuid4())
+    name = get_name(proc, kind, app_name)
+    session_type = "ide" if kind == "ide" else "terminal" if kind == "terminal" else "standalone"
+
+    data = {
+        "id": session_id,
+        "name": name,
+        "cwd": proc["cwd"],
+        "pid": proc["pid"],
+        "session_type": session_type,
+        "app_name": app_name,
+        "tags": {"registered_by": "scan-existing", "original_pid": proc["pid"]},
+    }
+
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-X", "POST",
+             f"{DAEMON_URL}/api/session/register",
+             "-H", "Content-Type: application/json",
+             "-d", json.dumps(data, ensure_ascii=False)],
+            capture_output=True, text=True, timeout=5,
+        )
+        resp = json.loads(result.stdout)
+        if resp.get("ok"):
+            return session_id
+        else:
+            print(f"  注册失败: {resp}", file=sys.stderr)
+            return None
+    except Exception as e:
+        print(f"  注册请求失败: {e}", file=sys.stderr)
+        return None
+
+
+def heartbeat(session_id: str, pid: int) -> None:
+    """发送心跳"""
+    try:
+        subprocess.run(
+            ["curl", "-s", "-X", "PUT",
+             f"{DAEMON_URL}/api/session/{session_id}/heartbeat",
+             "-H", "Content-Type: application/json",
+             "-d", json.dumps({"pid": pid})],
+            capture_output=True, timeout=3,
+        )
+    except Exception:
+        pass
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="扫描已有 claude 进程并注册到 daemon")
+    parser.add_argument("--daemon", action="store_true", help="注册后持续心跳守护")
+    parser.add_argument("--interval", type=int, default=5, help="心跳间隔（秒）")
+    args = parser.parse_args()
+
+    # 1. 查找所有 claude 进程
+    processes = find_claude_processes()
+
+    if not args.daemon:
+        # 单次模式：注册并退出
+        _register_all(processes)
+        return
+
+    # daemon 模式：先注册所有进程
+    _register_all(processes)
+
+    def cleanup(*_args):
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    # 持续心跳循环
+    while True:
+        try:
+            # 获取所有 claude 进程
+            current = find_claude_processes()
+            current_pids = {p["pid"]: p for p in current} if current else {}
+
+            # 获取已注册 session
+            try:
+                result = subprocess.run(
+                    ["curl", "-s", f"{DAEMON_URL}/api/sessions"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                registered = json.loads(result.stdout).get("sessions", [])
+            except Exception:
+                registered = []
+
+            # 为活着的进程发心跳
+            registered_by_pid = {s.get("pid", 0): s for s in registered if s.get("pid")}
+
+            for pid, proc in current_pids.items():
+                existing = registered_by_pid.get(pid)
+                if existing:
+                    sid = existing["id"]
+                    try:
+                        # 发送心跳
+                        status = "running" if existing.get("status") != "running" else None
+                        payload = {"pid": pid}
+                        if status:
+                            payload["status"] = status
+                        subprocess.run(
+                            ["curl", "-s", "-X", "PUT",
+                             f"{DAEMON_URL}/api/session/{sid}/heartbeat",
+                             "-H", "Content-Type: application/json",
+                             "-d", json.dumps(payload)],
+                            capture_output=True, timeout=3,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    kind, app_name = detect_process_type(proc)
+                    register_session(proc, kind, app_name)
+
+            # 清理已死的
+            for s in registered:
+                pid = s.get("pid", 0)
+                if pid and s.get("status") in ("running", "waiting"):
+                    if pid not in current_pids:
+                        try:
+                            subprocess.run(
+                                ["curl", "-s", "-X", "PUT",
+                                 f"{DAEMON_URL}/api/session/{s['id']}/heartbeat",
+                                 "-H", "Content-Type: application/json",
+                                 "-d", json.dumps({"status": "stopped"})],
+                                capture_output=True, timeout=3,
+                            )
+                        except Exception:
+                            pass
+
+            time.sleep(args.interval)
+        except Exception:
+            time.sleep(args.interval)
+            continue
+
+
+def _register_all(processes: list[dict]) -> None:
+    """单次注册所有进程"""
+    try:
+        result = subprocess.run(
+            ["curl", "-s", f"{DAEMON_URL}/api/sessions"],
+            capture_output=True, text=True, timeout=5,
+        )
+        registered = json.loads(result.stdout).get("sessions", [])
+        registered_pids = {s.get("pid") for s in registered if s.get("pid")}
+    except Exception:
+        registered_pids = set()
+
+    count = 0
+    for proc in processes:
+        pid = proc["pid"]
+        if pid in registered_pids:
+            # 已注册但可能 stopped，恢复为 running
+            for s in json.loads(subprocess.run(
+                ["curl", "-s", f"{DAEMON_URL}/api/sessions"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout).get("sessions", []):
+                if s.get("pid") == pid and s.get("status") == "stopped":
+                    try:
+                        subprocess.run(
+                            ["curl", "-s", "-X", "PUT",
+                             f"{DAEMON_URL}/api/session/{s['id']}/heartbeat",
+                             "-H", "Content-Type: application/json",
+                             "-d", json.dumps({"pid": pid, "status": "running"})],
+                            capture_output=True, timeout=3,
+                        )
+                        print(f"  🔄 PID {pid} 已恢复为 running")
+                    except Exception:
+                        pass
+            continue
+
+        kind, app_name = detect_process_type(proc)
+        session_id = register_session(proc, kind, app_name)
+
+        if session_id:
+            count += 1
+            type_icon = "💻" if kind in ("terminal", "standalone") else "🔌"
+            print(f"  {type_icon} PID {pid} → {get_name(proc, kind, app_name)} (type={kind})")
+
+    print(f"\n✅ 共 {count} 个新 session 注册，已有 session 已恢复")
+    print("   在飞书使用 /list 查看")
+
+
+if __name__ == "__main__":
+    main()

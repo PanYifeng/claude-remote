@@ -1,5 +1,13 @@
-"""Lark 机器人 — 消息收发与命令处理"""
+"""Lark 机器人 — 事件消费与消息收发
 
+使用 lark-cli 的事件消费能力而非 webhook：
+- 通过 `lark-cli event consume im.message.receive_v1 --as bot` 接收消息
+- 通过 `lark-cli im send` 发送回复
+
+无需 Cloudflare 隧道或公网 webhook。
+"""
+
+import asyncio
 import json
 import logging
 import shlex
@@ -44,8 +52,41 @@ class LarkBot:
         self.screen_mgr = screen_mgr
         self.ide_ctrl = ide_ctrl or IDEControl()
 
+    async def handle_event_line(self, line: dict) -> Optional[dict]:
+        """处理从 event consume 流接收到的单条事件
+
+        lark-cli event consume 输出格式:
+        {
+            "chat_id": "oc_xxx",
+            "chat_type": "p2p",
+            "content": "消息文本内容",
+            "message_id": "om_xxx",
+            "message_type": "text",
+            "sender_id": "ou_xxx",
+        }
+        """
+        try:
+            msg_type = line.get("message_type", "")
+            content = line.get("content", "")
+            chat_id = line.get("chat_id", "")
+            message_id = line.get("message_id", "")
+            sender_id = line.get("sender_id", "")
+
+            if not content or not chat_id:
+                return None
+
+            # 处理命令
+            response = await self._process_command(content.strip(), sender_id)
+            if response:
+                await self._reply_message(chat_id, message_id, response)
+
+            return {"code": 0}
+        except Exception as e:
+            logger.error("Failed to handle event line: %s", e, exc_info=True)
+            return None
+
     async def handle_webhook(self, body: dict) -> Optional[dict]:
-        """处理 Lark 事件回调
+        """处理 Lark 事件回调（webhook 方式，兼容保留）
 
         Lark 事件类型:
         - url_verification: URL 验证挑战
@@ -162,7 +203,8 @@ class LarkBot:
 
             # 会话类型图标
             stype = s.get("session_type", "screen")
-            type_icon = "💻" if stype == "screen" else "🔌"
+            type_icon = {"screen": "💻", "ide": "🔌", "standalone": "💻", "terminal": "💻"}.get(stype, "💻")
+            type_label = {"screen": "独立终端", "ide": "IDE 终端", "standalone": "终端", "terminal": "终端"}.get(stype, "终端")
 
             sid = s["id"][:8]  # 短 ID
             name = s.get("name", "") or sid
@@ -405,7 +447,9 @@ class LarkBot:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate(timeout=10)
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=10
+            )
             if proc.returncode != 0:
                 logger.error(
                     "Failed to send Lark message: %s", stderr.decode()
@@ -414,6 +458,37 @@ class LarkBot:
             return True
         except Exception as e:
             logger.error("Error sending Lark message: %s", e)
+            return False
+
+    async def _reply_message(self, chat_id: str, message_id: str, text: str) -> bool:
+        """回复消息（使用消息 ID 回复，创建线程）
+
+        使用 lark-cli im reply 命令。
+        """
+        if not chat_id or not message_id:
+            return await self._send_message(chat_id, text)
+
+        try:
+            # 使用 --text 参数简化回复
+            proc = await asyncio.create_subprocess_exec(
+                "lark-cli", "im", "+messages-reply",
+                "--message-id", message_id,
+                "--text", text,
+                "--as", "bot",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=10
+            )
+            if proc.returncode != 0:
+                logger.error(
+                    "Failed to reply Lark message: %s", stderr.decode()
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.error("Error replying Lark message: %s", e)
             return False
 
     def _resolve_id(self, short_id: str) -> Optional[str]:
