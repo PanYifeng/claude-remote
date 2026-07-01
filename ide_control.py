@@ -217,6 +217,95 @@ class IDEControl:
         except Exception:
             return False
 
+    def read_terminal_output(self, lines: int = 50) -> tuple[str, int]:
+        """Read macOS Terminal.app visible content via AppleScript
+
+        Quick, non-invasive read of visible terminal content.
+        Used by health check (runs every 5s, cannot steal focus).
+
+        Args:
+            lines: Number of tail lines to return
+
+        Returns:
+            (output_text, line_count)
+        """
+        script = """
+        tell application "Terminal"
+            try
+                set allContent to contents of selected tab of front window
+                return allContent
+            on error
+                return ""
+            end try
+        end tell
+        """
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=5,
+            )
+            text = result.stdout.strip()
+            if text:
+                line_count = len(text.splitlines())
+                if line_count > lines:
+                    text = "\n".join(text.splitlines()[-lines:])
+                    line_count = lines
+                return text, line_count
+        except Exception:
+            pass
+        return "", 0
+
+    def read_terminal_full_output(self, lines: int = 50) -> tuple[str, int]:
+        """Read macOS Terminal.app full scrollback via clipboard
+
+        Uses Cmd+A → Cmd+C → read clipboard to get complete terminal history.
+        Only call on user demand (/status), NOT in health check loop.
+
+        Args:
+            lines: Number of tail lines to return
+
+        Returns:
+            (output_text, line_count)
+        """
+        saved = self._get_clipboard()
+        try:
+            script = """
+            tell application "Terminal"
+                activate
+            end tell
+            delay 0.1
+            tell application "System Events"
+                tell process "Terminal"
+                    set frontmost to true
+                    delay 0.05
+                    keystroke "a" using command down
+                end tell
+            end tell
+            delay 0.1
+            tell application "System Events"
+                tell process "Terminal"
+                    keystroke "c" using command down
+                end tell
+            end tell
+            """
+            subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, timeout=3,
+            )
+        except Exception:
+            pass
+        output = self._get_clipboard()
+        if saved:
+            self._set_clipboard(saved)
+        if not output:
+            return "", 0
+        text = output
+        line_count = len(text.splitlines())
+        if line_count > lines:
+            text = "\n".join(text.splitlines()[-lines:])
+            line_count = lines
+        return text, line_count
+
     def read_output(self, app_name: str, lines: int = 50) -> tuple[str, int]:
         """Read IDE terminal output via Select All → Copy → Clipboard
 
