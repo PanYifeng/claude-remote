@@ -275,16 +275,12 @@ def main() -> None:
                 if existing:
                     sid = existing["id"]
                     try:
-                        # 发送心跳
-                        status = "running" if existing.get("status") != "running" else None
-                        payload = {"pid": pid}
-                        if status:
-                            payload["status"] = status
+                        # 发送心跳（只发 pid，不覆盖 status——status 由 daemon 健康检查管理）
                         subprocess.run(
                             ["curl", "-s", "-X", "PUT",
                              f"{DAEMON_URL}/api/session/{sid}/heartbeat",
                              "-H", "Content-Type: application/json",
-                             "-d", json.dumps(payload)],
+                             "-d", json.dumps({"pid": pid})],
                             capture_output=True, timeout=3,
                         )
                     except Exception:
