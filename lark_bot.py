@@ -11,7 +11,10 @@ No Cloudflare tunnel or public webhook required.
 import asyncio
 import json
 import logging
+import os
 import shlex
+import subprocess
+import uuid
 from typing import Optional, List
 
 from config import config
@@ -24,6 +27,7 @@ from lark_card import (
     pending_card,
     confirm_all_card,
     done_card,
+    interactive_card,
 )
 
 logger = logging.getLogger("lark_bot")
@@ -31,10 +35,14 @@ logger = logging.getLogger("lark_bot")
 _session_context: dict[str, dict] = {}
 
 COMMAND_HELP = """
-/l list                       — List all sessions with interactive card
+/l list                       — List all sessions
 /status <id|N>                — Show session details
 /send <id|N> <text>           — Send command to session
 /confirm [id|N]               — Confirm (Enter). No arg = last session
+/enter <id|N>                 — Enter interactive mode with a session
+/exit [--kill]                — Exit interactive mode (--kill also stops session)
+/ls [path]                    — List directory contents on host
+/new <path>                   — Start a new claude session in directory
 /pending                      — List sessions waiting for input
 /confirm-all                  — Confirm all waiting sessions
 /select <id|N> <n>            — Select option N
@@ -43,8 +51,10 @@ COMMAND_HELP = """
 /help                         — Show this help
 
 Tips:
-  * Use number shortcuts: `/confirm 1`, `/status 2`, `/send 3 pwd`
-  * `/confirm` or `/interrupt` without ID acts on last session
+  * `/enter 1` then just type messages to chat with session 1
+  * `/exit` to leave interactive mode
+  * `/ls` to browse directories on the host
+  * `/new /path` to start a new claude session
 """
 
 
@@ -204,7 +214,40 @@ class LarkBot:
     # ── Command processing ────────────────────────────
 
     async def _process_command(self, text: str, chat_id: str) -> Optional[str]:
-        """Parse and execute /command"""
+        """Parse and execute /command
+
+        In interactive mode (ctx["mode"] is set), messages NOT starting
+        with "/" are sent directly to the interactive session.
+        """
+        ctx = _session_context.setdefault(chat_id, {"sessions": []})
+        mode_sid = ctx.get("mode")
+
+        # Interactive mode: non-command messages go to the session
+        if mode_sid and not text.startswith("/"):
+            s = self.registry.get(mode_sid)
+            if not s:
+                ctx["mode"] = None
+                return "❌ Session no longer exists. Exited interactive mode."
+
+            # Send text to session
+            stype = s.get("session_type", "screen")
+            if stype == "ide":
+                ok = self.ide_ctrl.send_keys(s.get("app_name", ""), text)
+            elif stype == "terminal":
+                ok = self.ide_ctrl.send_keys(s.get("app_name", "") or "Terminal", text)
+            else:
+                ok = await self.screen_mgr.send_keys(mode_sid, text)
+
+            if not ok:
+                return "❌ Send failed, session may be stopped"
+
+            # Wait for some output then read it
+            await asyncio.sleep(3)
+            output = await self._read_interactive_output(s)
+            self._send_card_to_chat(chat_id, interactive_card(text, output))
+            return ""  # Card sent, no text reply
+
+        # Normal command processing
         if not text.startswith("/"):
             return None
         parts = shlex.split(text[1:])
@@ -214,12 +257,15 @@ class LarkBot:
         args = parts[1:]
 
         handlers = {
-            "list": self._cmd_list, "l": self._cmd_list, "ls": self._cmd_list,
+            "list": self._cmd_list, "l": self._cmd_list,
             "status": self._cmd_status, "send": self._cmd_send,
             "confirm": self._cmd_confirm, "pending": self._cmd_pending,
             "confirm-all": self._cmd_confirm_all, "select": self._cmd_select,
             "interrupt": self._cmd_interrupt, "stop": self._cmd_stop,
             "help": self._cmd_help,
+            "enter": self._cmd_enter, "exit": self._cmd_exit,
+            "new": self._cmd_new,
+            "ls": self._cmd_ls,
         }
         handler = handlers.get(cmd)
         if not handler:
@@ -277,6 +323,130 @@ class LarkBot:
         return ""
 
     # ── Text-reply commands (keep text for simple ops) ──
+
+    async def _cmd_enter(self, args: list[str], chat_id: str) -> str:
+        """Enter interactive mode with a session"""
+        if not args:
+            return "Usage: `/enter <id|N>`\ne.g. `/enter 1`"
+        session_id = await self._resolve_target(args[0], chat_id)
+        if not session_id:
+            return f"❌ Session not found: `{args[0]}`"
+        s = self.registry.get(session_id)
+        if not s:
+            return "❌ Session no longer exists"
+        ctx = _session_context.setdefault(chat_id, {})
+        ctx["mode"] = session_id
+        logger.info("Interactive mode: chat=%s session=%s", chat_id[:12], session_id[:8])
+        return f"🔵 Interactive mode: **{s.get('name', session_id[:8])}**\n\nType any message to send to this session.\n`/exit` to leave (session kept alive).\n`/exit --kill` to leave and stop."
+
+    async def _cmd_exit(self, args: list[str], chat_id: str) -> str:
+        """Exit interactive mode"""
+        ctx = _session_context.get(chat_id, {})
+        mode_sid = ctx.get("mode")
+        if not mode_sid:
+            return "⚪ Not in interactive mode."
+        kill = "--kill" in args or "-k" in args
+        s = self.registry.get(mode_sid)
+        name = s.get("name", mode_sid[:8]) if s else mode_sid[:8]
+        if kill and s:
+            await self._stop_from_bot(s)
+        ctx["mode"] = None
+        logger.info("Exit interactive mode: chat=%s kill=%s", chat_id[:12], kill)
+        if kill:
+            return f"⏹️ Exited and stopped **{name}**."
+        return f"✅ Exited interactive mode. **{name}** kept alive."
+
+    async def _cmd_ls(self, args: list[str], chat_id: str) -> str:
+        """List directory contents"""
+        path = " ".join(args) if args else "."
+        # Expand ~ to home directory
+        path = os.path.expanduser(path)
+        try:
+            result = subprocess.run(
+                ["ls", "-la", path],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                output = result.stdout
+                if len(output) > 1500:
+                    output = output[-1500:]
+                return f"📂 `{path}`:\n```\n{output}\n```"
+            else:
+                return f"❌ `{path}`: {result.stderr.strip()}"
+        except subprocess.TimeoutExpired:
+            return f"❌ `ls` timed out on `{path}`"
+        except Exception as e:
+            return f"❌ {e}"
+
+    async def _cmd_new(self, args: list[str], chat_id: str) -> str:
+        """Start a new claude session in a directory and enter interactive mode"""
+        path = " ".join(args) if args else os.getcwd()
+        if not os.path.isdir(path):
+            return f"❌ Not a directory: `{path}`"
+
+        session_id = str(uuid.uuid4())
+        screen_name = f"claude-{session_id[:12]}"
+        log_path = f"/tmp/claude-{session_id}.log"
+        name = os.path.basename(path)
+
+        try:
+            pid = await self.screen_mgr.create(session_id, cwd=path, log_path=log_path)
+        except Exception as e:
+            return f"❌ Failed to create session: {e}"
+
+        self.registry.register(
+            session_id, screen_name,
+            name=f"New — {name}", pid=pid,
+            cwd=path, log_path=log_path,
+            session_type="screen",
+        )
+
+        # Update list cache and enter interactive mode
+        ctx = _session_context.setdefault(chat_id, {})
+        sessions = self.registry.list()
+        ctx["sessions"] = [s["id"] for s in sessions]
+        ctx["mode"] = session_id
+        logger.info("New session + interactive mode: %s %s", session_id[:8], path)
+
+        return f"✅ New session in `{path}`\nEntered interactive mode. Type messages to chat.\n`/exit` to leave (session kept alive)."
+
+    async def _read_interactive_output(self, s: dict) -> str:
+        """Read session output for interactive mode display
+
+        Tries to read from session log file (works for screen sessions created via /new).
+        Falls back to clipboard capture for Terminal.app (works for frontmost terminal window).
+        """
+        session_id = s["id"]
+        log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
+        try:
+            # Try log file first (per-session, reliable)
+            for attempt in range(6):
+                if os.path.exists(log_path):
+                    out, _ = await self.screen_mgr.read_output(session_id, 30)
+                    if out and len(out) > 10:
+                        lines = [l for l in out.splitlines()
+                                 if l.strip() and not l.strip().startswith("─")
+                                 and not l.strip().startswith("❯")
+                                 and not l.strip().startswith("  ⏵")]
+                        return "\n".join(lines[-25:]) if lines else out[-500:]
+                await asyncio.sleep(1)
+
+            # No log file — try Terminal.app clipboard (last resort)
+            try:
+                out, _ = self.ide_ctrl.read_terminal_full_output(25)
+                if out:
+                    lines = [l for l in out.splitlines()
+                             if l.strip() and not l.strip().startswith("─")
+                             and not l.strip().startswith("❯")
+                             and not l.strip().startswith("  ⏵")]
+                    if lines:
+                        return "\n".join(lines[-20:])
+            except Exception:
+                pass
+
+            return "(sent — check the terminal window directly)"
+        except Exception as e:
+            return f"(error: {e})"
 
     async def _cmd_send(self, args: list[str], chat_id: str) -> str:
         if len(args) < 2:

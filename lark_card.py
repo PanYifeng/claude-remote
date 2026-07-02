@@ -161,6 +161,20 @@ def _cmd(cmd: str) -> dict:
     return {"tag": "div", "text": {"tag": "lark_md", "content": cmd}}
 
 
+def interactive_card(cmd: str, output: str) -> str:
+    """Card showing the result of an interactive command"""
+    display = output[-500:] if output else "(no output yet)"
+    card = {
+        "config": {"wide_screen_mode": False},
+        "header": {"title": {"tag": "lark_md", "content": f"💬 {cmd}"}},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": f"**Output / 输出:**\n```\n{display}\n```"}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": "Type more to continue, or:\n`/exit`  `/exit --kill`"}},
+        ],
+    }
+    return json.dumps(card, ensure_ascii=False)
+
+
 def _session_label(s: dict) -> str:
     stype = s.get("session_type", "screen")
     app = s.get("app_name", "")
