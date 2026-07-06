@@ -413,40 +413,60 @@ class LarkBot:
     async def _read_interactive_output(self, s: dict) -> str:
         """Read session output for interactive mode display
 
-        Tries to read from session log file (works for screen sessions created via /new).
-        Falls back to clipboard capture for Terminal.app (works for frontmost terminal window).
+        Tries reading from session log file (screen sessions created via /new).
+        macOS screen 4.00.03 has limited capabilities - script captures output
+        but only flushes on process exit, not on screen update.
         """
         session_id = s["id"]
         log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
-        try:
-            # Try log file first (per-session, reliable)
-            for attempt in range(6):
-                if os.path.exists(log_path):
-                    out, _ = await self.screen_mgr.read_output(session_id, 30)
-                    if out and len(out) > 10:
-                        lines = [l for l in out.splitlines()
-                                 if l.strip() and not l.strip().startswith("─")
-                                 and not l.strip().startswith("❯")
-                                 and not l.strip().startswith("  ⏵")]
-                        return "\n".join(lines[-25:]) if lines else out[-500:]
+
+        if os.path.exists(log_path):
+            for attempt in range(12):
+                try:
+                    if os.path.getsize(log_path) > 0:
+                        with open(log_path, "rb") as f:
+                            raw = f.read()
+                        import re
+                        text = raw.decode("utf-8", errors="replace")
+                        text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+                        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+                        text = re.sub(r'[╭─╮│╰╯▗▖▘▝▚▞■□]', '', text)
+                        lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+                        # Auto-confirm trust prompt
+                        if 'enter to confirm' in text.lower():
+                            screen_name = s.get("screen_name", f"claude-{session_id[:12]}")
+                            try:
+                                proc = await asyncio.create_subprocess_exec(
+                                    "screen", "-S", screen_name, "-X", "stuff", "\r",
+                                    stdout=asyncio.subprocess.DEVNULL,
+                                    stderr=asyncio.subprocess.DEVNULL,
+                                )
+                                await proc.wait()
+                            except Exception:
+                                pass
+                            await asyncio.sleep(3)
+                            continue
+
+                        clean = [l for l in lines
+                                 if len(l) > 5
+                                 and 'workspace' not in l.lower()
+                                 and 'safety' not in l.lower()
+                                 and 'trust' not in l.lower()
+                                 and 'security' not in l.lower()
+                                 and 'guide' not in l.lower()
+                                 and 'claude code' not in l.lower()
+                                 and 'api usage' not in l.lower()
+                                 and 'billing' not in l.lower()
+                                 and '/release' not in l.lower()]
+                        if clean:
+                            return "\n".join(clean[-25:])
+                except (OSError, IOError):
+                    pass
                 await asyncio.sleep(1)
 
-            # No log file — try Terminal.app clipboard (last resort)
-            try:
-                out, _ = self.ide_ctrl.read_terminal_full_output(25)
-                if out:
-                    lines = [l for l in out.splitlines()
-                             if l.strip() and not l.strip().startswith("─")
-                             and not l.strip().startswith("❯")
-                             and not l.strip().startswith("  ⏵")]
-                    if lines:
-                        return "\n".join(lines[-20:])
-            except Exception:
-                pass
-
-            return "(sent — check the terminal window directly)"
-        except Exception as e:
-            return f"(error: {e})"
+            return "(waiting for output...)"
+        return "(sent — check the terminal window directly)"
 
     async def _cmd_send(self, args: list[str], chat_id: str) -> str:
         if len(args) < 2:

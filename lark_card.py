@@ -109,6 +109,9 @@ def session_status_card(s: dict, output: str = "", idx: int = -1) -> str:
     elements.append(_md("📤 Send / 发送命令（末尾补上具体命令）"))
     elements.append(_cmd(f"/send {idx_s} "))
 
+    elements.append(_md("💬 Interactive / 交互模式（直接对话）"))
+    elements.append(_cmd(f"/enter {idx_s}"))
+
     card = {
         "config": {"wide_screen_mode": False},
         "header": {"title": {"tag": "lark_md", "content": f"📊 [{idx_s}] {label}"}},
@@ -169,7 +172,7 @@ def interactive_card(cmd: str, output: str) -> str:
         "header": {"title": {"tag": "lark_md", "content": f"💬 {cmd}"}},
         "elements": [
             {"tag": "div", "text": {"tag": "lark_md", "content": f"**Output / 输出:**\n```\n{display}\n```"}},
-            {"tag": "div", "text": {"tag": "lark_md", "content": "Type more to continue, or:\n`/exit`  `/exit --kill`"}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": "⬇️ Continue or exit / 继续或退出\n`/exit`  `/exit --kill`"}},
         ],
     }
     return json.dumps(card, ensure_ascii=False)

@@ -255,6 +255,40 @@ class IDEControl:
             pass
         return "", 0
 
+    def read_terminal_by_app(self, app_name: str, lines: int = 50) -> tuple[str, int]:
+        """Read terminal content, activating the target app first
+
+        For interactive mode: activate the correct app before reading,
+        so we read the right window's content.
+
+        Args:
+            app_name: "Terminal", "IntelliJ IDEA", "PyCharm", etc.
+            lines: Number of tail lines
+
+        Returns:
+            (output_text, line_count)
+        """
+        import time
+        try:
+            # Activate the target app so its window becomes frontmost
+            activate_script = f"""
+            tell application "{app_name}"
+                activate
+            end tell
+            delay 0.2
+            """
+            subprocess.run(["osascript", "-e", activate_script], capture_output=True, timeout=3)
+            time.sleep(0.3)
+
+            # Now read its content
+            if app_name == "Terminal":
+                return self.read_terminal_output(lines)
+            else:
+                return self.read_output(app_name, lines)
+        except Exception as e:
+            logger.warning("read_terminal_by_app(%s) failed: %s", app_name, e)
+            return "", 0
+
     def read_terminal_full_output(self, lines: int = 50) -> tuple[str, int]:
         """Read macOS Terminal.app full scrollback via clipboard
 
