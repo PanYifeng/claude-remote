@@ -229,20 +229,18 @@ class LarkBot:
                 ctx["mode"] = None
                 return "❌ Session no longer exists. Exited interactive mode."
 
-            # Send text to session
             stype = s.get("session_type", "screen")
-            if stype == "ide":
-                ok = self.ide_ctrl.send_keys(s.get("app_name", ""), text)
-            elif stype == "terminal":
-                ok = self.ide_ctrl.send_keys(s.get("app_name", "") or "Terminal", text)
-            else:
-                ok = await self.screen_mgr.send_keys(mode_sid, text)
 
+            # Only screen sessions (created via /new) support interactive mode
+            # Terminal.app has multiple tabs/windows; AppleScript can't target a specific one
+            if stype != "screen":
+                return "❌ Interactive mode only works with screen sessions.\nUse `/new <path>` to create one, or `/send <id> <text>` to send a single command."
+
+            ok = await self.screen_mgr.send_keys(mode_sid, text)
             if not ok:
                 return "❌ Send failed, session may be stopped"
 
-            # Wait for some output then read it
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
             output = await self._read_interactive_output(s)
             self._send_card_to_chat(chat_id, interactive_card(text, output))
             return ""  # Card sent, no text reply
@@ -413,14 +411,15 @@ class LarkBot:
     async def _read_interactive_output(self, s: dict) -> str:
         """Read session output for interactive mode display
 
-        Tries reading from session log file (screen sessions created via /new).
-        macOS screen 4.00.03 has limited capabilities - script captures output
-        but only flushes on process exit, not on screen update.
+        Only screen sessions (created via /new) have reliable per-session log files.
+        For terminal/IDE sessions, output reading is not available — the AppleScript
+        approach reads the frontmost Terminal window which is the daemon's own session.
         """
         session_id = s["id"]
         log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
+        stype = s.get("session_type", "screen")
 
-        if os.path.exists(log_path):
+        if stype == "screen" and os.path.exists(log_path):
             for attempt in range(12):
                 try:
                     if os.path.getsize(log_path) > 0:
@@ -433,7 +432,6 @@ class LarkBot:
                         text = re.sub(r'[╭─╮│╰╯▗▖▘▝▚▞■□]', '', text)
                         lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-                        # Auto-confirm trust prompt
                         if 'enter to confirm' in text.lower():
                             screen_name = s.get("screen_name", f"claude-{session_id[:12]}")
                             try:
@@ -452,21 +450,14 @@ class LarkBot:
                                  if len(l) > 5
                                  and 'workspace' not in l.lower()
                                  and 'safety' not in l.lower()
-                                 and 'trust' not in l.lower()
-                                 and 'security' not in l.lower()
-                                 and 'guide' not in l.lower()
-                                 and 'claude code' not in l.lower()
-                                 and 'api usage' not in l.lower()
-                                 and 'billing' not in l.lower()
-                                 and '/release' not in l.lower()]
+                                 and 'trust' not in l.lower()]
                         if clean:
                             return "\n".join(clean[-25:])
                 except (OSError, IOError):
                     pass
                 await asyncio.sleep(1)
 
-            return "(waiting for output...)"
-        return "(sent — check the terminal window directly)"
+        return "(sent — view output in the terminal directly)"
 
     async def _cmd_send(self, args: list[str], chat_id: str) -> str:
         if len(args) < 2:

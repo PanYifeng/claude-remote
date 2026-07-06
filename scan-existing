@@ -327,23 +327,7 @@ def _register_all(processes: list[dict]) -> None:
     for proc in processes:
         pid = proc["pid"]
         if pid in registered_pids:
-            # 已注册但可能 stopped，恢复为 running
-            for s in json.loads(subprocess.run(
-                ["curl", "-s", f"{DAEMON_URL}/api/sessions"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout).get("sessions", []):
-                if s.get("pid") == pid and s.get("status") == "stopped":
-                    try:
-                        subprocess.run(
-                            ["curl", "-s", "-X", "PUT",
-                             f"{DAEMON_URL}/api/session/{s['id']}/heartbeat",
-                             "-H", "Content-Type: application/json",
-                             "-d", json.dumps({"pid": pid, "status": "running"})],
-                            capture_output=True, timeout=3,
-                        )
-                        print(f"  🔄 PID {pid} 已恢复为 running")
-                    except Exception:
-                        pass
+            # 已注册，跳过（保留 daemon 管理的状态）
             continue
 
         kind, app_name = detect_process_type(proc)

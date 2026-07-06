@@ -302,6 +302,7 @@ class Daemon:
         sessions = self.registry.list(status_filter="running")
         sessions += self.registry.list(status_filter="waiting")
         sessions += self.registry.list(status_filter="idle")
+        sessions += self.registry.list(status_filter="executing")
         now = time.time()
 
         for s in sessions:
