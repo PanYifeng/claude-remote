@@ -13,7 +13,9 @@ def session_list_card(sessions: list[dict]) -> str:
     if not active:
         active = sessions[:5]
 
-    # 'running' = alive but no log output (sessions not started via lcc)
+    # Sort by session ID for stable ordering
+    active.sort(key=lambda s: s["id"])
+
     waiting = [s for s in active if s.get("status") == "waiting"]
     executing = [s for s in active if s.get("status") == "executing"]
     active_others = [s for s in active if s.get("status") not in ("waiting", "executing")]
@@ -23,34 +25,27 @@ def session_list_card(sessions: list[dict]) -> str:
     if waiting:
         rows.append(_md(f"🟡 **Waiting / 待确认 ({len(waiting)})**"))
         for s in waiting:
-            idx = active.index(s) + 1
+            sid = s["id"][:8]
             label = _session_label(s)
-            rows.append(_md(f"🟡 **[{idx}]** {label}"))
-            rows.append(_cmd(f"/confirm {idx}"))
+            rows.append(_md(f"🟡 **{sid}** {label}"))
+            rows.append(_cmd(f"/confirm {sid}"))
         rows.append({"tag": "hr"})
 
     if executing:
         rows.append(_md(f"🔵 **Executing / 执行中 ({len(executing)})**"))
         for s in executing:
-            idx = active.index(s) + 1
+            sid = s["id"][:8]
             label = _session_label(s)
-            tags = s.get("tags", {})
-            activity = ""
-            if isinstance(tags, dict):
-                activity = tags.get("activity", "")
-            line = f"🔵 **[{idx}]** {label}"
-            if activity:
-                line += f"\n   {activity[:50]}"
-            rows.append(_md(line))
-            rows.append(_cmd(f"/status {idx}"))
+            rows.append(_md(f"🔵 **{sid}** {label}"))
+            rows.append(_cmd(f"/status {sid}"))
 
     if active_others:
         rows.append(_md(f"🟢 **Active / 活动 ({len(active_others)})**"))
         for s in active_others:
-            idx = active.index(s) + 1
+            sid = s["id"][:8]
             label = _session_label(s)
-            rows.append(_md(f"🟢 **[{idx}]** {label}"))
-            rows.append(_cmd(f"/status {idx}"))
+            rows.append(_md(f"🟢 **{sid}** {label}"))
+            rows.append(_cmd(f"/status {sid}"))
 
     rows.append({"tag": "hr"})
     rows.append(_md("⬇️ Select & copy a command below / 长按选择复制命令"))
@@ -78,7 +73,7 @@ def session_status_card(s: dict, output: str = "", idx: int = -1) -> str:
     status_text = {"running": "🟢 Running / 运行中", "waiting": "🟡 Waiting / 待确认",
                    "executing": "🔵 Executing / 执行中", "idle": "⏸️ Idle / 空闲",
                    "stopped": "🔴 Stopped / 已停止"}.get(status, status)
-    idx_s = str(idx) if idx > 0 else s["id"][:8]
+    sid = s["id"][:8]
 
     elements = [_md(f"**Status / 状态:** {status_text}\n**Dir / 目录:** `{cwd}`")]
 
@@ -98,23 +93,23 @@ def session_status_card(s: dict, output: str = "", idx: int = -1) -> str:
     elements.append(_md("⬇️ Select & copy / 长按选择复制"))
 
     elements.append(_md("✅ Confirm / 确认（继续执行）"))
-    elements.append(_cmd(f"/confirm {idx_s}"))
+    elements.append(_cmd(f"/confirm {sid}"))
 
     elements.append(_md("✋ Interrupt / 中断（Ctrl+C，停止当前命令，会话保留）"))
-    elements.append(_cmd(f"/interrupt {idx_s}"))
+    elements.append(_cmd(f"/interrupt {sid}"))
 
     elements.append(_md("⏹️ Stop / 终止（关闭整个会话，不可恢复）"))
-    elements.append(_cmd(f"/stop {idx_s}"))
+    elements.append(_cmd(f"/stop {sid}"))
 
     elements.append(_md("📤 Send / 发送命令（末尾补上具体命令）"))
-    elements.append(_cmd(f"/send {idx_s} "))
+    elements.append(_cmd(f"/send {sid} "))
 
     elements.append(_md("💬 Interactive / 交互模式（直接对话）"))
-    elements.append(_cmd(f"/enter {idx_s}"))
+    elements.append(_cmd(f"/enter {sid}"))
 
     card = {
         "config": {"wide_screen_mode": False},
-        "header": {"title": {"tag": "lark_md", "content": f"📊 [{idx_s}] {label}"}},
+        "header": {"title": {"tag": "lark_md", "content": f"📊 [{sid}] {label}"}},
         "elements": elements,
     }
     return json.dumps(card, ensure_ascii=False)

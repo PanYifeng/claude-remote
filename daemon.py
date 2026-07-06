@@ -173,9 +173,20 @@ class Daemon:
 
     async def _stop_cmd(self, session):
         stype = session.get("session_type", "screen")
+        pid = session.get("pid", 0)
         if stype in ("ide", "terminal"):
             app = session.get("app_name") or ("Terminal" if stype == "terminal" else "")
             self.ide_ctrl.send_ctrl_c(app)
+            # Also kill the actual process
+            if pid:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "kill", "-9", str(pid),
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc.wait()
+                except Exception:
+                    pass
             return True
         await self.screen_mgr.send_ctrl_c(session["id"])
         await asyncio.sleep(0.5)

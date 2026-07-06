@@ -274,8 +274,10 @@ def main() -> None:
                 existing = registered_by_pid.get(pid)
                 if existing:
                     sid = existing["id"]
+                    # Don't restore stopped sessions — user explicitly stopped them
+                    if existing.get("status") == "stopped":
+                        continue
                     try:
-                        # 发送心跳（只发 pid，不覆盖 status——status 由 daemon 健康检查管理）
                         subprocess.run(
                             ["curl", "-s", "-X", "PUT",
                              f"{DAEMON_URL}/api/session/{sid}/heartbeat",
