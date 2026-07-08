@@ -274,8 +274,28 @@ def main() -> None:
                 existing = registered_by_pid.get(pid)
                 if existing:
                     sid = existing["id"]
-                    # Don't restore stopped sessions — user explicitly stopped them
+                    # Don't re-activate user-stopped sessions
+                    tags = existing.get("tags", {})
+                    if isinstance(tags, str):
+                        try:
+                            tags = json.loads(tags)
+                        except json.JSONDecodeError:
+                            tags = {}
+                    user_stopped = tags.get("user_stopped", False)
+                    if user_stopped:
+                        continue
+                    # Re-activate stopped sessions with alive processes
                     if existing.get("status") == "stopped":
+                        try:
+                            subprocess.run(
+                                ["curl", "-s", "-X", "PUT",
+                                 f"{DAEMON_URL}/api/session/{sid}/heartbeat",
+                                 "-H", "Content-Type: application/json",
+                                 "-d", json.dumps({"pid": pid, "status": "running"})],
+                                capture_output=True, timeout=3,
+                            )
+                        except Exception:
+                            pass
                         continue
                     try:
                         subprocess.run(
@@ -288,6 +308,10 @@ def main() -> None:
                     except Exception:
                         pass
                 else:
+                    # 本地去重：同一个 PID 在单轮扫描中只注册一次
+                    # scan-existing 可能扫描到同名同 PID 的进程（如多个 claude 进程但在 PS 中列多次）
+                    if pid not in registered_pids:
+                        registered_pids.add(pid)
                     kind, app_name = detect_process_type(proc)
                     register_session(proc, kind, app_name)
 
@@ -315,6 +339,7 @@ def main() -> None:
 
 def _register_all(processes: list[dict]) -> None:
     """单次注册所有进程"""
+    seen_pids: set[int] = set()
     try:
         result = subprocess.run(
             ["curl", "-s", f"{DAEMON_URL}/api/sessions"],
@@ -329,8 +354,10 @@ def _register_all(processes: list[dict]) -> None:
     for proc in processes:
         pid = proc["pid"]
         if pid in registered_pids:
-            # 已注册，跳过（保留 daemon 管理的状态）
             continue
+        if pid in seen_pids:
+            continue
+        seen_pids.add(pid)
 
         kind, app_name = detect_process_type(proc)
         session_id = register_session(proc, kind, app_name)

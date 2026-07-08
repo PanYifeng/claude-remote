@@ -246,7 +246,13 @@ class SessionRegistry:
                     "SELECT * FROM sessions WHERE status IN ('running', 'waiting')"
                 )
                 for row in cur.fetchall():
-                    if row["screen_name"] not in active_screen_names:
+                    r = dict(row)
+                    stype = r.get("session_type", "screen")
+                    # terminal/IDE sessions don't depend on screen sessions — preserve their status
+                    if stype in ("terminal", "ide"):
+                        recovered.append(r)
+                        continue
+                    if r["screen_name"] not in active_screen_names:
                         conn.execute(
                             "UPDATE sessions SET status = 'stopped', updated_at = ? WHERE id = ?",
                             (time.time(), row["id"]),

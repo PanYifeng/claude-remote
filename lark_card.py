@@ -18,7 +18,8 @@ def session_list_card(sessions: list[dict]) -> str:
 
     waiting = [s for s in active if s.get("status") == "waiting"]
     executing = [s for s in active if s.get("status") == "executing"]
-    active_others = [s for s in active if s.get("status") not in ("waiting", "executing")]
+    idle = [s for s in active if s.get("status") == "idle"]
+    active_others = [s for s in active if s.get("status") not in ("waiting", "executing", "idle")]
 
     rows = []
 
@@ -39,6 +40,14 @@ def session_list_card(sessions: list[dict]) -> str:
             rows.append(_md(f"🔵 **{sid}** {label}"))
             rows.append(_cmd(f"/status {sid}"))
 
+    if idle:
+        rows.append(_md(f"⏸️ **Idle / 空闲 ({len(idle)})**"))
+        for s in idle:
+            sid = s["id"][:8]
+            label = _session_label(s)
+            rows.append(_md(f"⏸️ **{sid}** {label}"))
+            rows.append(_cmd(f"/status {sid}"))
+
     if active_others:
         rows.append(_md(f"🟢 **Active / 活动 ({len(active_others)})**"))
         for s in active_others:
@@ -55,6 +64,7 @@ def session_list_card(sessions: list[dict]) -> str:
     parts = []
     if waiting: parts.append(f"🟡{len(waiting)}")
     if executing: parts.append(f"🔵{len(executing)}")
+    if idle: parts.append(f"⏸️{len(idle)}")
     if active_others: parts.append(f"🟢{len(active_others)}")
     title += " · " + " ".join(parts) if parts else ""
 
@@ -167,6 +177,22 @@ def interactive_card(cmd: str, output: str) -> str:
         "header": {"title": {"tag": "lark_md", "content": f"💬 {cmd}"}},
         "elements": [
             {"tag": "div", "text": {"tag": "lark_md", "content": f"**Output / 输出:**\n```\n{display}\n```"}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": "⬇️ Continue or exit / 继续或退出\n`/exit`  `/exit --kill`"}},
+        ],
+    }
+    return json.dumps(card, ensure_ascii=False)
+
+
+def streaming_card(cmd: str, output: str, done: bool = False) -> str:
+    """Card showing streaming output, updated in-place"""
+    icon = "✅" if done else "⏳"
+    status = "Done" if done else "Executing..."
+    display = output[-500:] if output else "(waiting for output...)"
+    card = {
+        "config": {"wide_screen_mode": False},
+        "header": {"title": {"tag": "lark_md", "content": f"{icon} {cmd}"}},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": f"**{status} / 执行中:**\n```\n{display}\n```"}},
             {"tag": "div", "text": {"tag": "lark_md", "content": "⬇️ Continue or exit / 继续或退出\n`/exit`  `/exit --kill`"}},
         ],
     }

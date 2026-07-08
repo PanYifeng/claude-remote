@@ -28,6 +28,7 @@ from lark_card import (
     confirm_all_card,
     done_card,
     interactive_card,
+    streaming_card,
 )
 
 logger = logging.getLogger("lark_bot")
@@ -232,7 +233,6 @@ class LarkBot:
             stype = s.get("session_type", "screen")
 
             # Only screen sessions (created via /new) support interactive mode
-            # Terminal.app has multiple tabs/windows; AppleScript can't target a specific one
             if stype != "screen":
                 return "❌ Interactive mode only works with screen sessions.\nUse `/new <path>` to create one, or `/send <id> <text>` to send a single command."
 
@@ -240,9 +240,51 @@ class LarkBot:
             if not ok:
                 return "❌ Send failed, session may be stopped"
 
-            await asyncio.sleep(2)
-            output = await self._read_interactive_output(s)
-            self._send_card_to_chat(chat_id, interactive_card(text, output))
+            # Streaming output: send initial card, then poll and update in-place
+            log_path = s.get("log_path", f"/tmp/claude-{mode_sid}.log")
+            initial_card = streaming_card(text, "")
+            message_id = self._send_card_to_chat(chat_id, initial_card)
+            if not message_id:
+                return "❌ Failed to send card"
+
+            # Save message_id so /exit can update the card
+            ctx["last_msg_id"] = message_id
+
+            # Poll log file and update card in-place
+            last_size = 0
+            if os.path.exists(log_path):
+                try:
+                    last_size = os.path.getsize(log_path)
+                except OSError:
+                    pass
+            no_change = 0
+            for _ in range(30):  # Up to ~60 seconds
+                await asyncio.sleep(2)
+                current_size = 0
+                if os.path.exists(log_path):
+                    try:
+                        current_size = os.path.getsize(log_path)
+                    except OSError:
+                        pass
+                if current_size > last_size:
+                    last_size = current_size
+                    output = self._read_log_output(log_path)
+                    if output:
+                        self._update_card_message(message_id, streaming_card(text, output))
+                    no_change = 0
+                else:
+                    no_change += 1
+
+                # Check if output has stabilized (prompt or waiting pattern)
+                if output and self._looks_stable(output):
+                    break
+                # No change for 2 rounds (4 seconds) -> stable
+                if no_change >= 2:
+                    break
+
+            # Final update
+            output = self._read_log_output(log_path) if os.path.exists(log_path) else ""
+            self._update_card_message(message_id, streaming_card(text, output, done=True))
             return ""  # Card sent, no text reply
 
         # Normal command processing
@@ -350,6 +392,17 @@ class LarkBot:
             await self._stop_from_bot(s)
         ctx["mode"] = None
         logger.info("Exit interactive mode: chat=%s kill=%s", chat_id[:12], kill)
+
+        # 更新上一次交互卡片为已停止状态
+        last_msg_id = ctx.get("last_msg_id", "")
+        if kill:
+            done = done_card(f"⏹️ **{name}** 已停止。")
+        else:
+            done = done_card(f"✅ 已退出交互模式。**{name}** 保持运行。")
+        if last_msg_id:
+            self._update_card_message(last_msg_id, done)
+            return ""  # 卡片已更新，无需文本回复
+        # 没有交互卡片可更新时，返回文本反馈
         if kill:
             return f"⏹️ Exited and stopped **{name}**."
         return f"✅ Exited interactive mode. **{name}** kept alive."
@@ -399,65 +452,122 @@ class LarkBot:
             session_type="screen",
         )
 
+        # Wait for claude to start and auto-confirm trust prompt
+        # Claude takes ~30s to start on this machine
+        import asyncio as _asyncio
+        started = False
+        for i in range(35):
+            try:
+                if os.path.exists(log_path) and os.path.getsize(log_path) > 500:
+                    with open(log_path, "rb") as f:
+                        raw = f.read()
+                    import re
+                    text = raw.decode("utf-8", errors="replace")
+                    text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+                    # Auto-confirm trust prompt
+                    if 'enter to confirm' in text.lower():
+                        await self.screen_mgr.send_enter(session_id)
+                        await _asyncio.sleep(3)
+                        started = True
+                        break
+                    started = True
+                    break
+            except Exception:
+                pass
+            await _asyncio.sleep(1)
+
+        status = "started" if started else "starting (may take a moment)"
+
         # Update list cache and enter interactive mode
         ctx = _session_context.setdefault(chat_id, {})
         sessions = self.registry.list()
         ctx["sessions"] = [s["id"] for s in sessions]
         ctx["mode"] = session_id
-        logger.info("New session + interactive mode: %s %s", session_id[:8], path)
+        logger.info("New session + interactive mode: %s %s (ready=%s)", session_id[:8], path, started)
 
-        return f"✅ New session in `{path}`\nEntered interactive mode. Type messages to chat.\n`/exit` to leave (session kept alive)."
+        return f"✅ New session in `{path}` ({status}).\nMessages you send will go to this session.\n`/exit` to leave."
 
     async def _read_interactive_output(self, s: dict) -> str:
         """Read session output for interactive mode display
 
-        Only screen sessions (created via /new) have reliable per-session log files.
-        For terminal/IDE sessions, output reading is not available — the AppleScript
-        approach reads the frontmost Terminal window which is the daemon's own session.
+        Tries log file first (screen sessions via /new), then falls back
+        to Terminal.app clipboard capture (reads frontmost window).
         """
         session_id = s["id"]
         log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
-        stype = s.get("session_type", "screen")
 
-        if stype == "screen" and os.path.exists(log_path):
-            for attempt in range(12):
+        # Try log file (screen sessions created via /new)
+        if os.path.exists(log_path):
+            try:
+                initial_size = os.path.getsize(log_path)
+            except OSError:
+                initial_size = 0
+
+            for attempt in range(10):
                 try:
-                    if os.path.getsize(log_path) > 0:
+                    size = os.path.getsize(log_path)
+                    if size > initial_size or (size > 50 and attempt == 0):
                         with open(log_path, "rb") as f:
                             raw = f.read()
-                        import re
-                        text = raw.decode("utf-8", errors="replace")
-                        text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
-                        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-                        text = re.sub(r'[╭─╮│╰╯▗▖▘▝▚▞■□]', '', text)
-                        lines = [l.strip() for l in text.splitlines() if l.strip()]
-
-                        if 'enter to confirm' in text.lower():
-                            screen_name = s.get("screen_name", f"claude-{session_id[:12]}")
-                            try:
-                                proc = await asyncio.create_subprocess_exec(
-                                    "screen", "-S", screen_name, "-X", "stuff", "\r",
-                                    stdout=asyncio.subprocess.DEVNULL,
-                                    stderr=asyncio.subprocess.DEVNULL,
-                                )
-                                await proc.wait()
-                            except Exception:
-                                pass
-                            await asyncio.sleep(3)
-                            continue
-
-                        clean = [l for l in lines
-                                 if len(l) > 5
-                                 and 'workspace' not in l.lower()
-                                 and 'safety' not in l.lower()
-                                 and 'trust' not in l.lower()]
-                        if clean:
-                            return "\n".join(clean[-25:])
+                        if len(raw) > 50:
+                            import re
+                            text = raw.decode("utf-8", errors="replace")
+                            text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+                            text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+                            lines = [l.strip() for l in text.splitlines() if l.strip()]
+                            clean = [l for l in lines if len(l) > 5]
+                            if clean:
+                                return "\n".join(clean[-25:])
+                            return text[-500:]
                 except (OSError, IOError):
                     pass
                 await asyncio.sleep(1)
 
+        # Fallback: Terminal.app clipboard (reads frontmost window)
+        # This may show the wrong session if multiple terminals are open
+        try:
+            for attempt in range(4):
+                await asyncio.sleep(1)
+                out, _ = self.ide_ctrl.read_terminal_full_output(25)
+                if out and len(out) > 50:
+                    lines = [l.strip() for l in out.splitlines()
+                             if l.strip() and not l.strip().startswith("─")
+                             and not l.strip().startswith("❯")
+                             and not l.strip().startswith("  ⏵")]
+                    if lines:
+                        return "\n".join(lines[-20:])
+        except Exception:
+            pass
+
         return "(sent — view output in the terminal directly)"
+
+    @staticmethod
+    def _read_log_output(log_path: str) -> str:
+        """Read and clean log file output"""
+        try:
+            with open(log_path, "rb") as f:
+                raw = f.read()
+            if len(raw) < 10:
+                return ""
+            import re
+            text = raw.decode("utf-8", errors="replace")
+            text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+            text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            clean = [l for l in lines if len(l) > 5]
+            if clean:
+                return "\n".join(clean[-25:])
+            return text[-500:]
+        except (OSError, IOError):
+            return ""
+
+    @staticmethod
+    def _looks_stable(output: str) -> bool:
+        """Check if output has stabilized (prompt or waiting pattern)"""
+        if not output:
+            return False
+        from screen_manager import ScreenManager
+        return ScreenManager._looks_waiting(output)
 
     async def _cmd_send(self, args: list[str], chat_id: str) -> str:
         if len(args) < 2:
@@ -587,12 +697,21 @@ class LarkBot:
         ctx = _session_context.get(chat_id)
         if not ctx:
             ctx = _session_context.setdefault(chat_id, {"sessions": []})
+
+        # If it's all digits, prefer short ID over numeric index
+        # (session IDs are 8+ chars, user session numbers are 1-2 digits)
         if arg.isdigit():
+            # Try short ID first (UUID first 8 chars)
+            resolved = self._resolve_id(arg)
+            if resolved:
+                return resolved
+            # Fall back to numeric index
             idx = int(arg) - 1
             cached = ctx.get("sessions", [])
             if 0 <= idx < len(cached):
                 return cached[idx]
             return None
+
         return self._resolve_id(arg)
 
     def _update_list_cache(self, chat_id: str) -> list:
@@ -660,16 +779,37 @@ class LarkBot:
     async def _stop_from_bot(self, s: dict) -> bool:
         session_id = s["id"]
         stype = s.get("session_type", "screen")
+        pid = s.get("pid", 0)
         if stype in ("ide", "terminal"):
             app = s.get("app_name") or ("Terminal" if stype == "terminal" else "")
             self.ide_ctrl.send_ctrl_c(app)
+            # 实际杀掉进程 — send_ctrl_c 只发送 Ctrl+C，进程可能不退出
+            if pid:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "kill", "-9", str(pid),
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc.wait()
+                except Exception:
+                    pass
         else:
             await self.screen_mgr.send_ctrl_c(session_id)
             await asyncio.sleep(0.5)
             await self.screen_mgr.send_keys(session_id, "exit")
             await asyncio.sleep(1)
             await self.screen_mgr.kill(session_id)
-        self.registry.update(session_id, status="stopped")
+        # 标记为用户主动停止，防止 scan-existing 重新激活
+        tags = s.get("tags", {})
+        if isinstance(tags, str):
+            try:
+                import json
+                tags = json.loads(tags)
+            except json.JSONDecodeError:
+                tags = {}
+        tags["user_stopped"] = True
+        self.registry.update(session_id, status="stopped", tags=tags)
         return True
 
     # ── Message sending ──────────────────────────────
@@ -711,11 +851,15 @@ class LarkBot:
             logger.error("Reply msg error: %s", e)
             return False
 
-    def _send_card_to_chat(self, chat_id: str, card_json: str) -> bool:
-        """Send a new interactive card to a chat"""
+    def _send_card_to_chat(self, chat_id: str, card_json: str) -> str:
+        """Send a new interactive card to a chat
+
+        Returns:
+            message_id (str) on success, empty string on failure
+        """
         if not chat_id:
             logger.warning("_send_card_to_chat: no chat_id")
-            return False
+            return ""
         try:
             import subprocess
             logger.info("Sending card to %s (len=%d)", chat_id[:15], len(card_json))
@@ -730,11 +874,43 @@ class LarkBot:
             if result.returncode != 0:
                 full_err = result.stderr[:500] if result.stderr else result.stdout[:500]
                 logger.warning("Send card failed (exit=%d): %s", result.returncode, full_err)
-                return False
+                return ""
             logger.info("Card sent OK to %s", chat_id[:15])
-            return True
+            # Parse message_id from response
+            try:
+                resp = json.loads(result.stdout)
+                msg_id = resp.get("data", {}).get("message_id", "")
+                if msg_id:
+                    return msg_id
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            return ""
         except Exception as e:
             logger.error("Send card error: %s", e)
+            return ""
+
+    def _update_card_message(self, message_id: str, card_json: str) -> bool:
+        """Update an existing interactive card message in-place via PATCH"""
+        if not message_id:
+            return False
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["lark-cli", "api", "PATCH",
+                 f"/open-apis/im/v1/messages/{message_id}",
+                 "--as", "bot",
+                 "--data", json.dumps({
+                     "msg_type": "interactive",
+                     "content": card_json,
+                 })],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                logger.warning("Update card failed (exit=%d): %s", result.returncode, result.stderr[:200])
+                return False
+            return True
+        except Exception as e:
+            logger.error("Update card error: %s", e)
             return False
 
     def _reply_card(self, chat_id: str, message_id: str, card_json: str) -> bool:

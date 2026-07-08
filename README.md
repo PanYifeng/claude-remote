@@ -19,22 +19,23 @@
 │  Daemon (Python aiohttp, port 9998)                 │
 │  • HTTP API server                                  │
 │  • Session registry (SQLite)                        │
-│  • Session management (screen + AppleScript)        │
+│  • Session management (tmux + AppleScript)          │
 │  • Interactive mode (chat with a session directly)  │
+│  • Streaming output (real-time card updates)        │
 │  • Periodic health check                            │
 │  • Lark event consumer (bot identity)               │
 └────┬───────────┬──────────┬─────────────────────────┘
      │           │          │
      ▼           ▼          ▼
-  screen       Terminal    IDE (IntelliJ/PyCharm)
-  (log file)   (AppleScript) (Accessibility API)
+   tmux        Terminal    IDE (IntelliJ/PyCharm)
+  (log file)  (AppleScript) (Accessibility API)
 ```
 
 ## Quick Start / 快速开始
 
 ### Prerequisites / 前置条件
 
-- macOS (requires `/usr/bin/screen`)
+- macOS (requires `tmux`, install via `brew install tmux`)
 - Python 3.11+
 - `lark-cli` (`brew install lark-cli`)
 - Lark app (create at [Lark Open Platform](https://open.feishu.cn))
@@ -45,6 +46,9 @@
 git clone https://github.com/PanYifeng/claude-remote.git
 cd claude-remote
 pip install aiohttp
+
+# Install tmux (required for new sessions)
+brew install tmux
 
 export LARK_APP_ID="cli_xxxxxxxxxxxxx"
 export LARK_APP_SECRET="xxxxxxxxxxxxxxxxxxxxx"
@@ -83,11 +87,13 @@ python3 scan-existing --daemon
 ```
 /l          → see sessions, note the number
 /enter 1    → enter interactive mode with session 1
-pwd         → sent to session, output returned
+pwd         → sent to session, output returned (streaming card updates)
 ls -la      → sent to session
 /exit       → leave interactive mode, session kept alive
-/exit --kill → leave and stop session
+/exit --kill → leave and stop session (card updated with stop status)
 ```
+
+> **Streaming output:** Interactive mode sends commands to tmux, then polls the log file every 2 seconds and updates the Lark card in-place via PATCH API. You see output appear progressively as the command executes — no more waiting for completion.
 
 ### Control Commands / 控制命令
 
@@ -110,16 +116,17 @@ ls -la      → sent to session
 
 - Use number shortcuts: `/confirm 1`, `/status 2`, `/send 3 pwd`
 - `/confirm` or `/interrupt` without ID acts on last session
-- `/new <path>` creates a screen session + log file for accurate output reading
+- `/new <path>` creates a tmux session + log file for accurate output reading
 - ID supports fuzzy matching — first 8 chars are sufficient
+- `/exit --kill` updates the last interactive card with stop status
 
 ## Session Types / 会话类型
 
 | Icon | Type | Output Reading | Interactive Mode |
 |:----:|------|:-------------:|:----------------:|
-| 💻 | Screen (`/new`) | Log file ✅ | ✅ Full support |
-| 💻 | Terminal (native) | Frontmost window | ⚠️ Send only |
-| 🔌 | IDE (IntelliJ/PyCharm) | Clipboard capture | ⚠️ Send only |
+| 💻 | Tmux (`/new`) | Log file ✅ | ✅ Full support (streaming) |
+| 💻 | Terminal (native) | Process state | ⚠️ Send only |
+| 🔌 | IDE (IntelliJ/PyCharm) | N/A | ⚠️ Send only |
 
 ## Status Detection / 状态检测
 
@@ -127,14 +134,19 @@ ls -la      → sent to session
 |:------:|:----:|---------|
 | `running` | 🟢 | Alive, status unknown (no log file) |
 | `executing` | 🔵 | Has output → task in progress |
-| `waiting` | 🟡 | Waiting for confirm/input |
-| `idle` | ⚪ | At prompt, no task running |
-| `stopped` | 🔴 | Process exited |
+| `waiting` | 🟡 | Waiting for confirm/input (approval prompts) |
+| `idle` | ⏸️ | At prompt, no task running |
+| `stopped` | 🔴 | Process exited or killed |
+
+Status detection uses multiple strategies:
+1. **Log file analysis:** Screen sessions read log output; checks for waiting patterns across all lines (not just last)
+2. **Process state:** Terminal sessions read `ps` state — `R+` = executing, `S+` = idle
+3. **Waiting pattern matching:** Detects "Do you want to proceed?", "requires approval", "Esc to cancel", etc.
 
 ## Status Display / 卡片展示
 
 Each session in `/l` shows:
-- Status icon (🟢🔵🟡⚪)
+- Status icon (🟢🔵🟡⏸️🔴)
 - Type icon (💻🔌)
 - Number shortcut `[N]`
 - App name + project directory + TTY
@@ -145,13 +157,13 @@ Each session in `/l` shows:
 ```
 /Users/dp/repo/claude-remote/
 ├── daemon.py           # Main daemon — HTTP API + health check + event consume
-├── lark_bot.py         # Lark bot — command parsing, interactive mode, card sending
-├── lark_card.py        # Card builder — session list, status, interactive cards
-├── screen_manager.py   # Screen session lifecycle management
+├── lark_bot.py         # Lark bot — command parsing, interactive mode, streaming card updates
+├── lark_card.py        # Card builder — session list, status, streaming, done cards
+├── screen_manager.py   # Tmux session lifecycle management (replaces macOS broken screen)
 ├── registry.py         # SQLite session registry
 ├── ide_control.py      # IDE terminal control via AppleScript
 ├── config.py           # Configuration from env vars
-├── scan-existing       # Scan & register existing claude processes
+├── scan-existing       # Scan & register existing claude processes with heartbeat daemon
 ├── LICENSE             # MIT License
 └── README.md           # This file
 ```
@@ -174,6 +186,20 @@ Each session in `/l` shows:
 4. Add event: `im.message.receive_v1` (callback URL not needed, uses event consume)
 5. Publish a new version
 6. Set `LARK_APP_ID` and `LARK_APP_SECRET` as environment variables
+
+## Technical Notes / 技术说明
+
+### Why tmux instead of screen?
+
+macOS ships with `screen` version 4.00.03 (2006). Its `-X stuff` command returns success (exit code 0) but does not actually inject input into the session. `tmux` (installable via `brew install tmux`) provides reliable `send-keys` and is actively maintained.
+
+### Script flush interval
+
+The `-t 0` flag is passed to `script` to flush output after every character I/O event (default is 30 seconds). This ensures the log file is readable in real-time for streaming output.
+
+### Duplicate session prevention
+
+Each registered session has a `user_stopped` tag when stopped by the user. The `scan-existing` heartbeat daemon skips user-stopped sessions, preventing them from being re-activated.
 
 ## License / 许可证
 

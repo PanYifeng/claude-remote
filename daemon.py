@@ -346,25 +346,44 @@ class Daemon:
                 # Terminal: read output and detect waiting vs executing vs idle
                 # NEVER read IDE output here (steals focus via Cmd+A/Cmd+C)
                 if stype == "terminal":
-                    # Only use session-specific log file for status detection.
-                    # DO NOT use read_terminal_output() — it reads the frontmost
-                    # Terminal window, causing ALL sessions to show the same status.
+                    # Try reading from log file first (screen sessions via /new have log)
+                    log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
+                    has_log = os.path.exists(log_path)
                     output = ""
-                    output, _ = await self.screen_mgr.read_output(session_id, 15)
+                    if has_log:
+                        output, _ = await self.screen_mgr.read_output(session_id, 15)
 
-                    if output and ScreenManager._looks_waiting(output):
-                        status = "waiting"
-                    elif output:
-                        lines = [l.strip().rstrip() for l in output.strip().splitlines() if l.strip()]
-                        last_line = lines[-1] if lines else ""
-                        if last_line.endswith(("❯", "$", "#", ">")):
-                            status = "idle"
+                    if has_log and output:
+                        if ScreenManager._looks_waiting(output):
+                            status = "waiting"
                         else:
-                            status = "executing"
-                        self.registry.update(session_id, last_output=output[-500:])
+                            lines = [l.strip().rstrip() for l in output.strip().splitlines() if l.strip()]
+                            last_line = lines[-1] if lines else ""
+                            if last_line.endswith(("❯", "$", "#", ">")):
+                                status = "idle"
+                            else:
+                                status = "executing"
+                            self.registry.update(session_id, last_output=output[-500:])
                     else:
-                        # No log file — process is alive, status unknown
-                        status = "running"
+                        # No log file: use process state as heuristic.
+                        # Don't use read_terminal_output() — it reads the frontmost
+                        # Terminal tab, which is unreliable with multiple sessions.
+                        # S+ = sleeping (interruptible), foreground → idle at prompt
+                        # R+ = running (runnable), foreground → actively executing
+                        proc_state = ""
+                        try:
+                            p = await asyncio.create_subprocess_exec(
+                                "ps", "-p", str(pid), "-o", "state=",
+                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                            )
+                            stdout, _ = await p.communicate()
+                            proc_state = stdout.decode().strip()
+                        except Exception:
+                            pass
+                        if proc_state and proc_state[0] == "R":
+                            status = "executing"
+                        else:
+                            status = "idle"
 
                     if status != s.get("status"):
                         logger.info("Session %s status: %s -> %s", session_id[:8], s.get("status"), status)
@@ -393,7 +412,7 @@ class Daemon:
     async def event_consume_loop(self):
         """Consume im.message.receive_v1 events via lark-cli
 
-        Reads stdout for NDJSON events. stdin kept open via PIPE.
+        Must keep stdin PIPE open explicitly — lark-cli exits on stdin EOF.
         """
         logger.info("Starting Lark event consume")
 
@@ -407,6 +426,9 @@ class Daemon:
                     stderr=asyncio.subprocess.PIPE,
                 )
                 logger.info("Event consume started (PID: %d)", proc.pid)
+
+                # Keep stdin open explicitly — prevents GC from closing the pipe
+                stdin_keepalive = proc.stdin
 
                 assert proc.stdout is not None
                 while self._running and proc.returncode is None:
@@ -428,6 +450,7 @@ class Daemon:
 
                 await proc.wait()
                 logger.warning("Event consume exited (code: %d), restarting in 5s...", proc.returncode)
+                del stdin_keepalive
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
@@ -439,6 +462,29 @@ class Daemon:
         active_screens = await self.screen_mgr.list_sessions()
         recovered = self.registry.recover_sessions(set(active_screens))
         logger.info("Recovered %d active sessions from %d active screens", len(recovered), len(active_screens))
+
+        # 启动时重置 terminal/IDE session 状态，让 health check 重新判定
+        # 避免 daemon 重启后状态固化（如之前标记为 "executing" 但实际已等待）
+        all_sessions = self.registry.list()
+        for s in all_sessions:
+            if s.get("session_type") in ("terminal", "ide") and s.get("status") != "stopped":
+                self.registry.update(s["id"], status="running")
+                logger.info("Reset session %s status -> running (type=%s)", s["id"][:8], s.get("session_type"))
+
+        # 去重：同一 PID 保留最新一条记录，删除旧的
+        dedup_pids: dict[int, str] = {}  # pid -> session_id (keep newest)
+        dups = []
+        for s in sorted(all_sessions, key=lambda x: x.get("updated_at", 0)):
+            pid = s.get("pid", 0)
+            if pid and s.get("status") != "stopped":
+                if pid in dedup_pids:
+                    dups.append(s["id"])
+                    logger.info("Duplicate non-stopped session for PID %s: keep=%s delete=%s",
+                                pid, dedup_pids[pid][:8], s["id"][:8])
+                else:
+                    dedup_pids[pid] = s["id"]
+        for dup_id in dups:
+            self.registry.delete(dup_id)
 
         self._health_task = asyncio.create_task(self.health_check_loop(), name="health-check")
 
