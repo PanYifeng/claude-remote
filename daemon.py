@@ -73,6 +73,8 @@ class Daemon:
         self.app.router.add_post("/api/session/{session_id}/stop", self.handle_stop)
         self.app.router.add_post("/lark/webhook", self.handle_lark_webhook)
         self.app.router.add_get("/health", self.handle_health)
+        self.app.router.add_post("/api/daemon/stop", self.handle_daemon_stop)
+        self.app.router.add_post("/api/daemon/restart", self.handle_daemon_restart)
 
     # ── Handlers ────────────────────────────────
     async def handle_register_session(self, request):
@@ -299,6 +301,43 @@ class Daemon:
         uptime = time.time() - getattr(self, "_start_time", time.time())
         return self._json({"status": "ok", "sessions": self.registry.count_by_status(), "uptime": uptime})
 
+    async def handle_daemon_stop(self, request):
+        """Stop the daemon gracefully via API (used by /daemon stop command)"""
+        logger.info("Daemon stop requested via API")
+        asyncio.create_task(self._shutdown())
+        return self._json({"ok": True, "message": "Shutting down..."})
+
+    async def handle_daemon_restart(self, request):
+        """Restart the daemon via API (used by /daemon restart command)"""
+        logger.info("Daemon restart requested via API")
+        asyncio.create_task(self._restart())
+        return self._json({"ok": True, "message": "Restarting..."})
+
+    async def _shutdown(self):
+        """Graceful shutdown"""
+        self._running = False
+        if self._health_task:
+            self._health_task.cancel()
+        if self._event_task:
+            self._event_task.cancel()
+
+    async def _restart(self):
+        """Shutdown then restart daemon"""
+        import subprocess as _sp
+        import os as _os
+        # 启动新的 daemon 进程（使用 nohup 确保独立于当前进程树）
+        log_file = open("/tmp/daemon.log", "a")
+        _sp.Popen(
+            ["nohup", "/Users/dp/repo/.venv/bin/python3", __file__],
+            stdout=log_file,
+            stderr=_sp.STDOUT,
+            stdin=_os.devnull,
+        )
+        logger.info("New daemon spawned, shutting down old")
+        # 等待 500ms 确保 HTTP 响应已发送，再退出
+        await asyncio.sleep(0.5)
+        _os._exit(0)
+
     # ── Health check ────────────────────────────────
     async def health_check_loop(self):
         logger.info("Health check loop started (interval: %.1fs)", config.health_check_interval)
@@ -358,44 +397,48 @@ class Daemon:
                             status = "waiting"
                         else:
                             lines = [l.strip().rstrip() for l in output.strip().splitlines() if l.strip()]
+                            # Check if the ❯ prompt appears anywhere (not just last line)
+                            # Claude's UI has ❯ prompt on its own line, followed by status line
+                            has_prompt = any(l == "❯" or l.rstrip("\xa0").endswith("❯") for l in lines)
                             last_line = lines[-1] if lines else ""
-                            if last_line.endswith(("❯", "$", "#", ">")):
+                            if has_prompt or last_line.endswith(("❯", "$", "#", ">")):
                                 status = "idle"
                             else:
                                 status = "executing"
                             self.registry.update(session_id, last_output=output[-500:])
                     else:
-                        # No log file: use process state as heuristic.
-                        # Don't use read_terminal_output() — it reads the frontmost
-                        # Terminal tab, which is unreliable with multiple sessions.
-                        # S+ = sleeping (interruptible), foreground → idle at prompt
-                        # R+ = running (runnable), foreground → actively executing
-                        proc_state = ""
+                        # No log file: read Terminal.app frontmost tab (non-invasive).
+                        # read_terminal_output() uses AppleScript to read visible content
+                        # without clipboard or focus steal. Best-effort for single-tab users.
                         try:
-                            p = await asyncio.create_subprocess_exec(
-                                "ps", "-p", str(pid), "-o", "state=",
-                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                            )
-                            stdout, _ = await p.communicate()
-                            proc_state = stdout.decode().strip()
+                            output, _ = self.ide_ctrl.read_terminal_output(15)
                         except Exception:
-                            pass
-                        if proc_state and proc_state[0] == "R":
-                            status = "executing"
+                            output = ""
+
+                        if output:
+                            if ScreenManager._looks_waiting(output):
+                                status = "waiting"
+                            else:
+                                lines = [l.strip().rstrip() for l in output.strip().splitlines() if l.strip()]
+                                has_prompt = any(l == "❯" or l.rstrip("\xa0").endswith("❯") for l in lines)
+                                if has_prompt:
+                                    status = "idle"
+                                else:
+                                    status = "executing"
+                                self.registry.update(session_id, last_output=output[-500:])
                         else:
-                            status = "idle"
+                            status = "running"
 
                     if status != s.get("status"):
                         logger.info("Session %s status: %s -> %s", session_id[:8], s.get("status"), status)
                     self.registry.update(session_id, status=status)
                 elif stype == "ide":
-                    # IDE sessions: no log file, can't read output without focus steal.
-                    # Mark as "running" (alive, unknown activity).
-                    status = "running"
-                    if status != s.get("status"):
-                        self.registry.update(session_id, status=status)
-
-                self.registry.update(session_id, updated_at=now)
+                    # IDE sessions: preserve whatever status was detected.
+                    # Don't attempt to determine status in health check:
+                    # - read_output() steals focus (Cmd+A/Cmd+C)
+                    # - Process state S+ is meaningless (Claude is always S+)
+                    # Only /status command can detect waiting/idle/executing.
+                    status = s.get("status", "running")
                 continue
 
             # Screen session
@@ -464,9 +507,11 @@ class Daemon:
         logger.info("Recovered %d active sessions from %d active screens", len(recovered), len(active_screens))
 
         # 启动时重置 terminal/IDE session 状态，让 health check 重新判定
-        # 避免 daemon 重启后状态固化（如之前标记为 "executing" 但实际已等待）
+        # 但保留 waiting 状态（用户通过 /status 检测到的）
         all_sessions = self.registry.list()
         for s in all_sessions:
+            if s.get("status") == "waiting":
+                continue
             if s.get("session_type") in ("terminal", "ide") and s.get("status") != "stopped":
                 self.registry.update(s["id"], status="running")
                 logger.info("Reset session %s status -> running (type=%s)", s["id"][:8], s.get("session_type"))

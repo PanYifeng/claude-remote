@@ -7,9 +7,9 @@ Provides:
 - send_enter(): Send Enter
 - send_ctrl_c(): Send Ctrl+C
 - list_terminals(): List all controllable IDE terminals
-- read_output(): Read terminal output via Select All → Copy → Clipboard
+- read_output(): Read terminal output via Select All -> Copy -> Clipboard
 
-Requires: System Settings → Privacy & Security → Accessibility → authorize python3
+Requires: System Settings -> Privacy & Security -> Accessibility -> authorize python3
 """
 
 import logging
@@ -256,21 +256,9 @@ class IDEControl:
         return "", 0
 
     def read_terminal_by_app(self, app_name: str, lines: int = 50) -> tuple[str, int]:
-        """Read terminal content, activating the target app first
-
-        For interactive mode: activate the correct app before reading,
-        so we read the right window's content.
-
-        Args:
-            app_name: "Terminal", "IntelliJ IDEA", "PyCharm", etc.
-            lines: Number of tail lines
-
-        Returns:
-            (output_text, line_count)
-        """
+        """Read terminal content, activating the target app first"""
         import time
         try:
-            # Activate the target app so its window becomes frontmost
             activate_script = f"""
             tell application "{app_name}"
                 activate
@@ -280,7 +268,6 @@ class IDEControl:
             subprocess.run(["osascript", "-e", activate_script], capture_output=True, timeout=3)
             time.sleep(0.3)
 
-            # Now read its content
             if app_name == "Terminal":
                 return self.read_terminal_output(lines)
             else:
@@ -290,17 +277,7 @@ class IDEControl:
             return "", 0
 
     def read_terminal_full_output(self, lines: int = 50) -> tuple[str, int]:
-        """Read macOS Terminal.app full scrollback via clipboard
-
-        Uses Cmd+A → Cmd+C → read clipboard to get complete terminal history.
-        Only call on user demand (/status), NOT in health check loop.
-
-        Args:
-            lines: Number of tail lines to return
-
-        Returns:
-            (output_text, line_count)
-        """
+        """Read macOS Terminal.app full scrollback via clipboard"""
         saved = self._get_clipboard()
         try:
             script = """
@@ -340,13 +317,24 @@ class IDEControl:
             line_count = lines
         return text, line_count
 
+    @staticmethod
+    def _app_to_process(app_name: str) -> str:
+        """Map display name (e.g. 'IntelliJ IDEA') to actual process name (e.g. 'idea')"""
+        return IDE_PROCESS_NAMES.get(app_name, app_name)
+
     def read_output(self, app_name: str, lines: int = 50) -> tuple[str, int]:
-        """Read IDE terminal output via Select All → Copy → Clipboard
+        """Read IDE terminal output via Select All -> Copy -> Clipboard
+
+        Single AppleScript: activate -> Cmd+A -> Cmd+C.
+        Does NOT press F12/Alt+F12 as those are unreliable across IDE versions.
+
+        The caller must check if the output looks like terminal content
+        (via _looks_waiting, presence of ❯, Claude UI patterns) vs editor content.
 
         Requires Accessibility permission and clipboard access.
 
         Args:
-            app_name: Application process name
+            app_name: Application display name (e.g. 'IntelliJ IDEA')
             lines: Number of tail lines to return
 
         Returns:
@@ -354,8 +342,51 @@ class IDEControl:
         """
         saved = self._get_clipboard()
 
-        self._select_all_terminal(app_name)
-        self._copy_to_clipboard(app_name)
+        process = self._app_to_process(app_name)
+        proc = process or app_name
+
+        # Single AppleScript: activate -> F12 x2 (toggle terminal open) -> Cmd+A -> Cmd+C
+        # F12 toggles the terminal panel in IntelliJ-based IDEs. Pressing it twice
+        # ensures the terminal is visible regardless of its prior state.
+        lines_raw = [
+            'tell application "' + app_name + '"',
+            '    activate',
+            'end tell',
+            'delay 0.3',
+            'tell application "System Events"',
+            '    tell process "' + proc + '"',
+            '        set frontmost to true',
+            '        delay 0.15',
+            '        key code 96',  # F12
+            '    end tell',
+            'end tell',
+            'delay 0.3',
+            'tell application "System Events"',
+            '    tell process "' + proc + '"',
+            '        key code 96',  # F12 again
+            '    end tell',
+            'end tell',
+            'delay 0.3',
+            'tell application "System Events"',
+            '    tell process "' + proc + '"',
+            '        keystroke "a" using command down',
+            '    end tell',
+            'end tell',
+            'delay 0.3',
+            'tell application "System Events"',
+            '    tell process "' + proc + '"',
+            '        keystroke "c" using command down',
+            '    end tell',
+            'end tell',
+        ]
+        script = '\n'.join(lines_raw)
+        try:
+            subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, timeout=10,
+            )
+        except Exception:
+            pass
 
         output = self._get_clipboard()
 
@@ -373,52 +404,6 @@ class IDEControl:
             line_count = lines
 
         return text, line_count
-
-    def _select_all_terminal(self, app_name: str) -> None:
-        """Select all terminal content via Cmd+A"""
-        script = f"""
-        tell application "{app_name}"
-            activate
-        end tell
-        delay 0.1
-        tell application "System Events"
-            tell process "{app_name}"
-                set frontmost to true
-                delay 0.08
-                keystroke "a" using command down
-            end tell
-        end tell
-        """
-        try:
-            subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, timeout=3,
-            )
-        except Exception:
-            pass
-
-    def _copy_to_clipboard(self, app_name: str) -> None:
-        """Copy selected content to clipboard via Cmd+C"""
-        script = f"""
-        tell application "{app_name}"
-            activate
-        end tell
-        delay 0.1
-        tell application "System Events"
-            tell process "{app_name}"
-                set frontmost to true
-                delay 0.08
-                keystroke "c" using command down
-            end tell
-        end tell
-        """
-        try:
-            subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, timeout=3,
-            )
-        except Exception:
-            pass
 
     @staticmethod
     def _get_clipboard() -> str:
@@ -467,11 +452,7 @@ class IDEControl:
 
     @staticmethod
     def _parse_ascript_records(text: str) -> list[dict]:
-        """Parse AppleScript record list output
-
-        AppleScript format: {app:XXX, pid:123, title:YYY, winID:456}
-        One record per line.
-        """
+        """Parse AppleScript record list output"""
         windows = []
         for line in text.strip().splitlines():
             line = line.strip()

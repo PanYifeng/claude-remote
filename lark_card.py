@@ -56,6 +56,12 @@ def session_list_card(sessions: list[dict]) -> str:
             rows.append(_md(f"🟢 **{sid}** {label}"))
             rows.append(_cmd(f"/status {sid}"))
 
+    # 提示：IDE 类型 session 需要 /status 查看精确状态
+    ide_count = sum(1 for s in active if s.get("session_type") == "ide")
+    if ide_count > 0:
+        rows.append({"tag": "hr"})
+        rows.append(_md("💡 IDE 会话（🔌）需要用 `/status <id>` 查看精确状态。"))
+
     rows.append({"tag": "hr"})
     rows.append(_md("⬇️ Select & copy a command below / 长按选择复制命令"))
     rows.append(_cmd("/confirm-all"))
@@ -80,12 +86,16 @@ def session_status_card(s: dict, output: str = "", idx: int = -1) -> str:
     label = _session_label(s)
     status = s.get("status", "unknown")
     cwd = s.get("cwd", "")
+    stype = s.get("session_type", "screen")
     status_text = {"running": "🟢 Running / 运行中", "waiting": "🟡 Waiting / 待确认",
                    "executing": "🔵 Executing / 执行中", "idle": "⏸️ Idle / 空闲",
                    "stopped": "🔴 Stopped / 已停止"}.get(status, status)
     sid = s["id"][:8]
 
     elements = [_md(f"**Status / 状态:** {status_text}\n**Dir / 目录:** `{cwd}`")]
+
+    if stype == "ide" and status == "running":
+        elements.append(_md("💡 IDE 会话无法自动检测状态。再次发送 `/status` 可读取终端内容获取精确状态。"))
 
     if output:
         # Filter: remove separator lines, prompt lines, and self-echo of commands

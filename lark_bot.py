@@ -49,6 +49,7 @@ COMMAND_HELP = """
 /select <id|N> <n>            — Select option N
 /interrupt [id|N]             — Send Ctrl+C. No arg = last session
 /stop <id|N>                  — Stop session
+/daemon (stop|restart|status) — Control daemon service
 /help                         — Show this help
 
 Tips:
@@ -306,6 +307,7 @@ class LarkBot:
             "enter": self._cmd_enter, "exit": self._cmd_exit,
             "new": self._cmd_new,
             "ls": self._cmd_ls,
+            "daemon": self._cmd_daemon,
         }
         handler = handlers.get(cmd)
         if not handler:
@@ -333,10 +335,49 @@ class LarkBot:
         if not s:
             return "❌ Session no longer exists"
 
-        # Use cached last_output only — never read clipboard here.
-        # Clipboard reads during /status processing capture whatever is
-        # frontmost (Lark chat, Terminal, etc.) and return wrong data.
+        # Try to read live output when possible without stealing focus
+        # IDE sessions need special handling — read_output() steals focus
+        # via Cmd+A/Cmd+C, so it's only done on-demand here (not in health check)
+        stype = s.get("session_type", "screen")
         output = s.get("last_output", "")
+        status = s.get("status", "running")
+        if stype == "ide":
+            try:
+                live_output, _ = self.ide_ctrl.read_output(s.get("app_name", ""), 15)
+                if live_output:
+                    output = live_output
+                    # Check if output looks like terminal content (❯ prompt, Claude UI)
+                    from screen_manager import ScreenManager
+                    if ScreenManager._looks_waiting(live_output):
+                        status = "waiting"
+                        self.registry.update(session_id, status=status)
+                    elif any(s in live_output for s in ("❯", "plan mode", "Claude")):
+                        # Terminal output visible but not waiting → idle
+                        status = "idle"
+                        self.registry.update(session_id, status=status)
+                    # Otherwise: output is probably editor content, not terminal
+                    # Don't change status
+            except Exception:
+                pass
+        elif stype == "terminal":
+            # Try log file for terminal sessions
+            log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
+            import os
+            if os.path.exists(log_path):
+                live_output = self._read_log_output(log_path)
+                if live_output:
+                    output = live_output
+                    self.registry.update(session_id, last_output=output[-500:])
+        elif stype == "screen":
+            log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
+            import os
+            if os.path.exists(log_path):
+                live_output = self._read_log_output(log_path)
+                if live_output:
+                    output = live_output
+
+        # Re-fetch to get updated status
+        s = self.registry.get(session_id)
         idx = self._find_index(session_id, chat_id)
         self._send_card_to_chat(chat_id, session_status_card(s, output, idx))
         return ""
@@ -690,6 +731,56 @@ class LarkBot:
 
     async def _cmd_help(self, _args: list[str], chat_id: str) -> str:
         return COMMAND_HELP
+
+    async def _cmd_daemon(self, args: list[str], chat_id: str) -> str:
+        """Control daemon service: stop, restart, status"""
+        if not args:
+            return "Usage: `/daemon (stop|restart|status)`"
+        action = args[0].lower()
+        if action == "status":
+            import os as _os
+            import time as _time
+            # 直接返回进程信息，不走 HTTP（避免阻塞事件循环无法响应自身请求）
+            pid = _os.getpid()
+            # 用 /proc 或 ps 获取进程启动时间
+            try:
+                import subprocess as _sp
+                r = _sp.run(
+                    ["ps", "-p", str(pid), "-o", "lstart="],
+                    capture_output=True, text=True, timeout=3,
+                )
+                return f"🟢 Daemon is running\n  PID: {pid}\n  Started: {r.stdout.strip()}"
+            except Exception:
+                return f"🟢 Daemon is running\n  PID: {pid}"
+            import subprocess as _sp
+            try:
+                _sp.run(
+                    ["curl", "-s", "-X", "POST", "http://127.0.0.1:9998/api/daemon/stop",
+                     "--connect-timeout", "2", "--max-time", "3"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                return "⏹️ Daemon stopped."
+            except Exception:
+                return "❌ Failed to stop daemon"
+        elif action == "restart":
+            import subprocess as _sp
+            import os as _os
+            daemon_dir = _os.path.dirname(_os.path.abspath(__file__))
+            daemon_py = daemon_dir + "/daemon.py"
+            # 后台脚本：先 kill 旧进程释放端口，再启动新 daemon
+            bg_script = (
+                "sleep 0.5 && "
+                "kill " + str(_os.getpid()) + " 2>/dev/null; "
+                "sleep 2 && "
+                "nohup /Users/dp/repo/.venv/bin/python3 " + daemon_py
+                + " > /tmp/daemon.log 2>&1 &"
+            )
+            _sp.Popen(
+                ["bash", "-c", bg_script],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
+            return "🔄 Daemon restarting...\nWait a few seconds, then use `/daemon status` to verify."
+        return "Usage: `/daemon (stop|restart|status)`"
 
     # ── Helpers ───────────────────────────────────────
 
