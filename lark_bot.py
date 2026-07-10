@@ -345,18 +345,19 @@ class LarkBot:
             try:
                 live_output, _ = self.ide_ctrl.read_output(s.get("app_name", ""), 15)
                 if live_output:
-                    output = live_output
                     # Check if output looks like terminal content (❯ prompt, Claude UI)
                     from screen_manager import ScreenManager
                     if ScreenManager._looks_waiting(live_output):
                         status = "waiting"
+                        output = live_output
                         self.registry.update(session_id, status=status)
                     elif any(s in live_output for s in ("❯", "plan mode", "Claude")):
                         # Terminal output visible but not waiting → idle
                         status = "idle"
+                        output = live_output
                         self.registry.update(session_id, status=status)
                     # Otherwise: output is probably editor content, not terminal
-                    # Don't change status
+                    # Keep cached output and don't change status
             except Exception:
                 pass
         elif stype == "terminal":
@@ -368,6 +369,22 @@ class LarkBot:
                 if live_output:
                     output = live_output
                     self.registry.update(session_id, last_output=output[-500:])
+            else:
+                # No log file: try reading Terminal.app content
+                try:
+                    live_output, _ = self.ide_ctrl.read_terminal_output(15)
+                    if live_output:
+                        from screen_manager import ScreenManager
+                        if ScreenManager._looks_waiting(live_output):
+                            status = "waiting"
+                            self.registry.update(session_id, status=status)
+                        elif any(x in live_output for x in ("❯", "plan mode", "Claude", "accept edits")):
+                            status = "idle"
+                            self.registry.update(session_id, status=status)
+                        output = live_output
+                        self.registry.update(session_id, last_output=output[-500:])
+                except Exception:
+                    pass
         elif stype == "screen":
             log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
             import os

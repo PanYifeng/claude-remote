@@ -348,37 +348,53 @@ class IDEControl:
         # Single AppleScript: activate -> F12 x2 (toggle terminal open) -> Cmd+A -> Cmd+C
         # F12 toggles the terminal panel in IntelliJ-based IDEs. Pressing it twice
         # ensures the terminal is visible regardless of its prior state.
-        lines_raw = [
-            'tell application "' + app_name + '"',
-            '    activate',
-            'end tell',
-            'delay 0.3',
-            'tell application "System Events"',
-            '    tell process "' + proc + '"',
-            '        set frontmost to true',
-            '        delay 0.15',
-            '        key code 96',  # F12
-            '    end tell',
-            'end tell',
-            'delay 0.3',
-            'tell application "System Events"',
-            '    tell process "' + proc + '"',
-            '        key code 96',  # F12 again
-            '    end tell',
-            'end tell',
-            'delay 0.3',
-            'tell application "System Events"',
-            '    tell process "' + proc + '"',
-            '        keystroke "a" using command down',
-            '    end tell',
-            'end tell',
-            'delay 0.3',
-            'tell application "System Events"',
-            '    tell process "' + proc + '"',
-            '        keystroke "c" using command down',
-            '    end tell',
-            'end tell',
-        ]
+        # For VS Code/Cursor, use Ctrl+` instead of F12.
+        if proc in ("idea", "pycharm", "webstorm"):
+            # IntelliJ-based: just activate + Cmd+A + Cmd+C.
+            # No Alt+F12/F12 — they TOGGLE the terminal panel, so if it's
+            # already open they close it, making things worse.
+            # If the terminal panel is already visible, this captures it.
+            # If the editor is focused, it captures editor content — which
+            # _cmd_status detects (no ❯/Claude patterns) and ignores.
+            lines_raw = [
+                'tell application "' + app_name + '"',
+                '    activate',
+                'end tell',
+                'delay 0.3',
+                'tell application "System Events"',
+                '    tell process "' + proc + '"',
+                '        set frontmost to true',
+                '        delay 0.15',
+                '        keystroke "a" using command down',
+                '    end tell',
+                'end tell',
+                'delay 0.2',
+                'tell application "System Events"',
+                '    tell process "' + proc + '"',
+                '        keystroke "c" using command down',
+                '    end tell',
+                'end tell',
+            ]
+        else:
+            lines_raw = [
+                'tell application "' + app_name + '"',
+                '    activate',
+                'end tell',
+                'delay 0.3',
+                'tell application "System Events"',
+                '    tell process "' + proc + '"',
+                '        set frontmost to true',
+                '        delay 0.15',
+                '        keystroke "a" using command down',
+                '    end tell',
+                'end tell',
+                'delay 0.2',
+                'tell application "System Events"',
+                '    tell process "' + proc + '"',
+                '        keystroke "c" using command down',
+                '    end tell',
+                'end tell',
+            ]
         script = '\n'.join(lines_raw)
         try:
             subprocess.run(

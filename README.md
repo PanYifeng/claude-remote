@@ -104,6 +104,7 @@ ls -la      → sent to session
 | `/interrupt [id\|N]` | Send Ctrl+C. No arg = last session |
 | `/stop <id\|N>` | Stop session |
 | `/select <id\|N> <n>` | Select option N |
+| `/daemon (stop\|restart\|status)` | Control daemon service |
 
 ### Host Commands / 主机命令
 
@@ -119,29 +120,33 @@ ls -la      → sent to session
 - `/new <path>` creates a tmux session + log file for accurate output reading
 - ID supports fuzzy matching — first 8 chars are sufficient
 - `/exit --kill` updates the last interactive card with stop status
+- `/status <id>` reads live terminal output for IDE sessions — detects waiting/idle/executing
 
 ## Session Types / 会话类型
 
-| Icon | Type | Output Reading | Interactive Mode |
-|:----:|------|:-------------:|:----------------:|
-| 💻 | Tmux (`/new`) | Log file ✅ | ✅ Full support (streaming) |
-| 💻 | Terminal (native) | Process state | ⚠️ Send only |
-| 🔌 | IDE (IntelliJ/PyCharm) | N/A | ⚠️ Send only |
+| Icon | Type | Output Reading | Interactive Mode | Status Detection |
+|:----:|------|:-------------:|:----------------:|:----------------:|
+| 💻 | Tmux (`/new`) | Log file ✅ | ✅ Full support (streaming) | ✅ Auto (log file) |
+| 💻 | Terminal (native) | N/A | ⚠️ Send only | ⚠️ Auto (running only) |
+| 🔌 | IDE (IntelliJ/PyCharm) | Live read (`/status`) | ⚠️ Send only | 🟢 Running (use `/status`) |
 
 ## Status Detection / 状态检测
 
-| Status | Icon | Meaning |
-|:------:|:----:|---------|
-| `running` | 🟢 | Alive, status unknown (no log file) |
-| `executing` | 🔵 | Has output → task in progress |
-| `waiting` | 🟡 | Waiting for confirm/input (approval prompts) |
-| `idle` | ⏸️ | At prompt, no task running |
-| `stopped` | 🔴 | Process exited or killed |
+| Status | Icon | Meaning | When |
+|:------:|:----:|---------|------|
+| `running` | 🟢 | Alive, unknown status | Default for IDE/terminal sessions without log files |
+| `executing` | 🔵 | Task in progress | Log file shows output with no prompt |
+| `waiting` | 🟡 | Waiting for confirm/input | Output contains approval prompts |
+| `idle` | ⏸️ | At prompt, no task running | Output ends with ❯ / $ prompt |
+| `stopped` | 🔴 | Process exited or killed | Process is dead or screen/tmux session gone |
+
+**Note:** IDE sessions (🔌) cannot be auto-detected by health check (would steal focus on every cycle).
+Use `/status <id>` to read live terminal output and get the accurate status (waiting, idle, or executing).
 
 Status detection uses multiple strategies:
-1. **Log file analysis:** Screen sessions read log output; checks for waiting patterns across all lines (not just last)
-2. **Process state:** Terminal sessions read `ps` state — `R+` = executing, `S+` = idle
-3. **Waiting pattern matching:** Detects "Do you want to proceed?", "requires approval", "Esc to cancel", etc.
+1. **Log file analysis:** Tmux sessions read log output every 5s; checks for waiting patterns, prompt suffix, or executing content
+2. **Live terminal read:** `/status <id>` reads IDE terminal content via AppleScript (Cmd+A → Cmd+C) to detect waiting/idle/executing
+3. **Waiting pattern matching:** Scans all lines for "Do you want to proceed?", "requires approval", "Esc to cancel", "Enter to confirm", etc.
 
 ## Status Display / 卡片展示
 

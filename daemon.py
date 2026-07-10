@@ -397,8 +397,6 @@ class Daemon:
                             status = "waiting"
                         else:
                             lines = [l.strip().rstrip() for l in output.strip().splitlines() if l.strip()]
-                            # Check if the ❯ prompt appears anywhere (not just last line)
-                            # Claude's UI has ❯ prompt on its own line, followed by status line
                             has_prompt = any(l == "❯" or l.rstrip("\xa0").endswith("❯") for l in lines)
                             last_line = lines[-1] if lines else ""
                             if has_prompt or last_line.endswith(("❯", "$", "#", ">")):
@@ -407,27 +405,11 @@ class Daemon:
                                 status = "executing"
                             self.registry.update(session_id, last_output=output[-500:])
                     else:
-                        # No log file: read Terminal.app frontmost tab (non-invasive).
-                        # read_terminal_output() uses AppleScript to read visible content
-                        # without clipboard or focus steal. Best-effort for single-tab users.
-                        try:
-                            output, _ = self.ide_ctrl.read_terminal_output(15)
-                        except Exception:
-                            output = ""
-
-                        if output:
-                            if ScreenManager._looks_waiting(output):
-                                status = "waiting"
-                            else:
-                                lines = [l.strip().rstrip() for l in output.strip().splitlines() if l.strip()]
-                                has_prompt = any(l == "❯" or l.rstrip("\xa0").endswith("❯") for l in lines)
-                                if has_prompt:
-                                    status = "idle"
-                                else:
-                                    status = "executing"
-                                self.registry.update(session_id, last_output=output[-500:])
-                        else:
-                            status = "running"
+                        # No log file: standalone terminal session.
+                        # read_terminal_output() reads the FRONTMOST Terminal tab,
+                        # which may not correspond to this session. Unreliable.
+                        # Mark as "running" (unknown) instead of misleading.
+                        status = "running"
 
                     if status != s.get("status"):
                         logger.info("Session %s status: %s -> %s", session_id[:8], s.get("status"), status)
