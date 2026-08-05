@@ -27,7 +27,7 @@ from config import config
 from lark_bot import LarkBot
 from registry import SessionRegistry
 from screen_manager import ScreenManager
-from ide_control import ide_control
+from ide_control import ide_control, read_claude_session_state, map_claude_status
 
 
 def setup_logging() -> None:
@@ -355,6 +355,15 @@ class Daemon:
         sessions += self.registry.list(status_filter="executing")
         now = time.time()
 
+        # 自动发现并注册新启动的 claude 进程
+        await self._auto_discover_claude_processes(sessions)
+
+        # 重新读取 session（可能被 auto_discover 新增了）
+        sessions = self.registry.list(status_filter="running")
+        sessions += self.registry.list(status_filter="waiting")
+        sessions += self.registry.list(status_filter="idle")
+        sessions += self.registry.list(status_filter="executing")
+
         for s in sessions:
             session_id = s["id"]
             stype = s.get("session_type", "screen")
@@ -385,42 +394,58 @@ class Daemon:
                 # Terminal: read output and detect waiting vs executing vs idle
                 # NEVER read IDE output here (steals focus via Cmd+A/Cmd+C)
                 if stype == "terminal":
-                    # Try reading from log file first (screen sessions via /new have log)
-                    log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
-                    has_log = os.path.exists(log_path)
-                    output = ""
-                    if has_log:
+                    # 优先用 Claude Code 的 per-process 状态文件（权威，非侵入）
+                    cs = read_claude_session_state(pid) if pid else None
+                    status = None
+                    if cs and cs.get("sessionId"):
+                        status = map_claude_status(cs.get("status", ""))
+                    if status:
+                        # 有 log 文件的会话再补一刀 approval 提示检测（claude status 未必标 waiting）
+                        log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
+                        if os.path.exists(log_path):
+                            try:
+                                output, _ = await self.screen_mgr.read_output(session_id, 15)
+                                if output and ScreenManager._looks_waiting(output):
+                                    status = "waiting"
+                                    self.registry.update(session_id, last_output=output[-500:])
+                            except Exception:
+                                pass
+                    elif os.path.exists(s.get("log_path", f"/tmp/claude-{session_id}.log")):
+                        # 无状态文件但有 log：用 log 内容判定
                         output, _ = await self.screen_mgr.read_output(session_id, 15)
-
-                    if has_log and output:
-                        if ScreenManager._looks_waiting(output):
-                            status = "waiting"
-                        else:
-                            lines = [l.strip().rstrip() for l in output.strip().splitlines() if l.strip()]
-                            has_prompt = any(l == "❯" or l.rstrip("\xa0").endswith("❯") for l in lines)
-                            last_line = lines[-1] if lines else ""
-                            if has_prompt or last_line.endswith(("❯", "$", "#", ">")):
-                                status = "idle"
+                        if output:
+                            if ScreenManager._looks_waiting(output):
+                                status = "waiting"
                             else:
-                                status = "executing"
-                            self.registry.update(session_id, last_output=output[-500:])
+                                lines = [l.strip().rstrip() for l in output.strip().splitlines() if l.strip()]
+                                has_prompt = any(l == "❯" or l.rstrip("\xa0").endswith("❯") for l in lines)
+                                last_line = lines[-1] if lines else ""
+                                if has_prompt or last_line.endswith(("❯", "$", "#", ">")):
+                                    status = "idle"
+                                else:
+                                    status = "executing"
+                                self.registry.update(session_id, last_output=output[-500:])
+                        else:
+                            status = "running"
                     else:
-                        # No log file: standalone terminal session.
-                        # read_terminal_output() reads the FRONTMOST Terminal tab,
-                        # which may not correspond to this session. Unreliable.
-                        # Mark as "running" (unknown) instead of misleading.
+                        # 无状态文件无 log：无法判定
                         status = "running"
 
                     if status != s.get("status"):
                         logger.info("Session %s status: %s -> %s", session_id[:8], s.get("status"), status)
                     self.registry.update(session_id, status=status)
                 elif stype == "ide":
-                    # IDE sessions: preserve whatever status was detected.
-                    # Don't attempt to determine status in health check:
-                    # - read_output() steals focus (Cmd+A/Cmd+C)
-                    # - Process state S+ is meaningless (Claude is always S+)
-                    # Only /status command can detect waiting/idle/executing.
-                    status = s.get("status", "running")
+                    # IDE 会话：用 Claude Code 的 per-process 状态文件判定（非侵入，不抢焦点）
+                    cs = read_claude_session_state(pid) if pid else None
+                    status = None
+                    if cs and cs.get("sessionId"):
+                        status = map_claude_status(cs.get("status", ""))
+                    if not status:
+                        # 无状态文件：保留原状态（不抢焦点读屏）
+                        status = s.get("status", "running")
+                    if status != s.get("status"):
+                        logger.info("Session %s status: %s -> %s", session_id[:8], s.get("status"), status)
+                        self.registry.update(session_id, status=status)
                 continue
 
             # Screen session
@@ -434,6 +459,202 @@ class Daemon:
             self.registry.update(session_id, status=status, last_output=output[-300:] if len(output) > 300 else output)
 
     # ── Event consume ────────────────────────────────
+    async def _auto_discover_claude_processes(self, existing_sessions: list[dict]) -> None:
+        """自动发现新启动的 claude 进程并注册到 daemon
+
+        每轮健康检查时扫描系统 claude 进程，如果发现未注册的新进程，
+        自动注册它。这样即使 scan-existing 没运行，新开的 session 也会被自动发现。
+        """
+        import uuid as _uuid
+
+        # 获取已注册的 PID 集合（包括 stopped 的 — 防止重复注册已停止的进程）
+        registered_pids = set()
+        all_sessions = self.registry.list()
+        for s in all_sessions:
+            pid = s.get("pid", 0)
+            if pid:
+                registered_pids.add(pid)
+
+        # 扫描当前 claude 进程
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ps", "-eo", "pid,tty,comm",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            claude_pids = set()
+            pid_tty_map: dict[int, str] = {}  # pid → tty，注册时存入 tags，便于按 TTY 定位终端 tab
+            for line in stdout.decode().splitlines():
+                parts = line.strip().split(None, 2)
+                if len(parts) < 3:
+                    continue
+                pid_str, tty, comm = parts
+                if comm == "claude" and tty != "??":
+                    try:
+                        pid = int(pid_str)
+                        claude_pids.add(pid)
+                        pid_tty_map[pid] = tty
+                    except ValueError:
+                        continue
+        except Exception:
+            return
+
+        # 排除 daemon 自身的进程和 screen 子进程
+        import os as _os
+        claude_pids.discard(_os.getpid())
+
+        # 排除 screen 管理的子进程（log 文件由 screen 管理，不是独立 session）
+        screen_claude_pids = set()
+        try:
+            sp = await asyncio.create_subprocess_exec(
+                "ps", "-eo", "pid,ppid,comm",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            sp_stdout, _ = await sp.communicate()
+            all_procs = sp_stdout.decode().splitlines()
+            # 找到所有 SCREEN 进程
+            screen_pids = set()
+            for line in all_procs:
+                parts = line.strip().split(None, 2)
+                if len(parts) >= 3 and parts[2] == "SCREEN":
+                    screen_pids.add(int(parts[0]))
+            # 找到 SCREEN 进程树下的所有子进程（递归）
+            all_pids = {}
+            for line in all_procs:
+                parts = line.strip().split(None, 2)
+                if len(parts) >= 3:
+                    try:
+                        all_pids[int(parts[0])] = int(parts[1])
+                    except ValueError:
+                        continue
+            for pid, ppid in list(all_pids.items()):
+                # 向上追溯父进程链，看是否最终属于某个 SCREEN
+                cur = pid
+                for _ in range(10):
+                    if cur in screen_pids:
+                        screen_claude_pids.add(pid)
+                        break
+                    if cur <= 1:
+                        break
+                    cur = all_pids.get(cur, 0)
+        except Exception:
+            pass
+        claude_pids -= screen_claude_pids
+
+        # 注册新发现的进程
+        for pid in sorted(claude_pids):
+            if pid in registered_pids:
+                continue
+
+            # 获取进程详细信息
+            try:
+                cwd_proc = await asyncio.create_subprocess_exec(
+                    "lsof", "-p", str(pid), "-Fn", "-a", "-d", "cwd",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+                cwd_stdout, _ = await cwd_proc.communicate()
+                cwd = ""
+                for cl in cwd_stdout.decode().splitlines():
+                    if cl.startswith("n/"):
+                        cwd = cl[1:]
+                        break
+            except Exception:
+                cwd = ""
+
+            # 检测进程类型（IDE vs Terminal）
+            kind, app_name = "terminal", ""
+            try:
+                ppid_proc = await asyncio.create_subprocess_exec(
+                    "ps", "-p", str(pid), "-o", "ppid=",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+                ppid_stdout, _ = await ppid_proc.communicate()
+                ppid = ppid_stdout.decode().strip()
+
+                # 向上查 5 层父进程找 IDE
+                found_ide = False
+                seen = {int(pid), int(ppid)} if ppid and ppid.isdigit() else {int(pid)}
+                current_pid = int(ppid) if ppid and ppid.isdigit() else 0
+                for _ in range(5):
+                    if current_pid <= 1:
+                        break
+                    try:
+                        p = await asyncio.create_subprocess_exec(
+                            "ps", "-p", str(current_pid), "-o", "comm=",
+                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        p_stdout, _ = await p.communicate()
+                        comm = p_stdout.decode().strip().lower()
+                        ide_map = {"idea": "IntelliJ IDEA", "pycharm": "PyCharm",
+                                   "code": "Code", "cursor": "Cursor", "windsurf": "Windsurf"}
+                        for key, name in ide_map.items():
+                            if key in comm:
+                                kind, app_name = "ide", name
+                                found_ide = True
+                                break
+                        if found_ide:
+                            break
+                        pp = await asyncio.create_subprocess_exec(
+                            "ps", "-p", str(current_pid), "-o", "ppid=",
+                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        pp_stdout, _ = await pp.communicate()
+                        next_pid = int(pp_stdout.decode().strip()) if pp_stdout.decode().strip().isdigit() else 0
+                        if next_pid in seen or next_pid <= 1:
+                            break
+                        seen.add(next_pid)
+                        current_pid = next_pid
+                    except Exception:
+                        break
+            except Exception:
+                pass
+
+            # 注册新 session
+            session_id = str(_uuid.uuid4())
+            stype = "ide" if kind == "ide" else "terminal"
+            name = f"{app_name} — {cwd.split('/')[-1] if cwd else '?'}" if app_name else f"Terminal — {cwd.split('/')[-1] if cwd else '?'}"
+            log_path = f"/tmp/claude-{session_id}.log"
+            screen_name = f"claude-{session_id[:12]}"
+
+            # 把 TTY 存入 tags，便于后续按 TTY 精确定位 Terminal.app 的 tab 读取输出
+            session_tags = {"auto_discovered": True}
+            tty = pid_tty_map.get(pid, "")
+            if tty:
+                session_tags["tty"] = tty
+
+            self.registry.register(
+                session_id, screen_name,
+                name=name, pid=pid,
+                cwd=cwd, log_path=log_path,
+                tags=session_tags, session_type=stype, app_name=app_name,
+            )
+            logger.info("Auto-discovered new session: %s (%s) pid=%d type=%s", session_id[:8], name, pid, stype)
+
+        # 回填：已注册的 terminal session 如果 tags 里没有 tty，按 pid 补上
+        for s in all_sessions:
+            if s.get("session_type") != "terminal":
+                continue
+            tags = s.get("tags", {}) or {}
+            if isinstance(tags, dict) and tags.get("tty"):
+                continue
+            spid = s.get("pid", 0)
+            tty = pid_tty_map.get(spid, "")
+            if not tty:
+                # pid_tty_map 只含 claude 进程；这里是回填，单独查一次 ps
+                try:
+                    tp = await asyncio.create_subprocess_exec(
+                        "ps", "-p", str(spid), "-o", "tty=",
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    ts, _ = await tp.communicate()
+                    tty = ts.decode().strip()
+                except Exception:
+                    tty = ""
+            if tty and tty != "??":
+                new_tags = dict(tags) if isinstance(tags, dict) else {}
+                new_tags["tty"] = tty
+                self.registry.update(s["id"], tags=json.dumps(new_tags, ensure_ascii=False))
+
     async def event_consume_loop(self):
         """Consume im.message.receive_v1 events via lark-cli
 

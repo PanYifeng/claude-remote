@@ -98,16 +98,11 @@ def session_status_card(s: dict, output: str = "", idx: int = -1) -> str:
         elements.append(_md("💡 IDE 会话无法自动检测状态。再次发送 `/status` 可读取终端内容获取精确状态。"))
 
     if output:
-        # Filter: remove separator lines, prompt lines, and self-echo of commands
-        lines = [l for l in output.splitlines()
-                 if l.strip()
-                 and not l.strip().startswith("─")
-                 and not l.strip().startswith("❯")
-                 and not l.strip().startswith("  ⏵")
-                 and not l.strip().startswith("/status")]
-        meaningful = "\n".join(lines[-15:]) if lines else output
-        if meaningful.strip():
-            elements.append(_md(f"**Output / 输出:**\n```\n{meaningful[-300:]}\n```"))
+        # 直接取末尾内容展示。等待提示（"Do you want to proceed?"、选项列表、
+        # "Esc to cancel"）通常就在末尾几行，不能像之前那样砍掉最后 4 行。
+        display = output[-500:]
+        if display.strip():
+            elements.append(_md(f"**Output / 输出:**\n```\n{display}\n```"))
 
     elements.append({"tag": "hr"})
     elements.append(_md("⬇️ Select & copy / 长按选择复制"))

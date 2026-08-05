@@ -335,63 +335,108 @@ class LarkBot:
         if not s:
             return "❌ Session no longer exists"
 
-        # Try to read live output when possible without stealing focus
-        # IDE sessions need special handling — read_output() steals focus
-        # via Cmd+A/Cmd+C, so it's only done on-demand here (not in health check)
+        # 优先用 Claude Code 的 per-process 状态文件（权威：精确 sessionId + 实时 status）
         stype = s.get("session_type", "screen")
         output = s.get("last_output", "")
         status = s.get("status", "running")
-        if stype == "ide":
-            try:
-                live_output, _ = self.ide_ctrl.read_output(s.get("app_name", ""), 15)
-                if live_output:
-                    # Check if output looks like terminal content (❯ prompt, Claude UI)
-                    from screen_manager import ScreenManager
-                    if ScreenManager._looks_waiting(live_output):
-                        status = "waiting"
-                        output = live_output
-                        self.registry.update(session_id, status=status)
-                    elif any(s in live_output for s in ("❯", "plan mode", "Claude")):
-                        # Terminal output visible but not waiting → idle
-                        status = "idle"
-                        output = live_output
-                        self.registry.update(session_id, status=status)
-                    # Otherwise: output is probably editor content, not terminal
-                    # Keep cached output and don't change status
-            except Exception:
-                pass
-        elif stype == "terminal":
-            # Try log file for terminal sessions
-            log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
-            import os
-            if os.path.exists(log_path):
-                live_output = self._read_log_output(log_path)
-                if live_output:
-                    output = live_output
-                    self.registry.update(session_id, last_output=output[-500:])
-            else:
-                # No log file: try reading Terminal.app content
-                try:
-                    live_output, _ = self.ide_ctrl.read_terminal_output(15)
-                    if live_output:
-                        from screen_manager import ScreenManager
-                        if ScreenManager._looks_waiting(live_output):
+        cwd = s.get("cwd", "")
+        pid = s.get("pid", 0)
+
+        from ide_control import (read_claude_session_state, map_claude_status,
+                                  read_last_assistant_message)
+        from screen_manager import ScreenManager
+
+        cs = read_claude_session_state(pid) if pid else None
+        used_authoritative = False
+        if cs and cs.get("sessionId"):
+            used_authoritative = True
+            cs_sid = cs["sessionId"]
+            # 内容：精确 transcript（不会张冠李戴）
+            ts_text, _ = read_last_assistant_message(cwd, cs_sid, 1200)
+            if ts_text:
+                output = ts_text
+            # 状态：claude 实时状态（busy→executing, shell/idle→idle, waiting→waiting）
+            mapped = map_claude_status(cs.get("status", ""))
+            if mapped:
+                status = mapped
+            # 待确认补充：终端会话再按 TTY 抓一下，approval 提示未必反映在 status 字段
+            if stype == "terminal" and status != "waiting":
+                tags = s.get("tags", {}) or {}
+                tty = tags.get("tty", "") if isinstance(tags, dict) else ""
+                if tty:
+                    try:
+                        live_output, _ = self.ide_ctrl.read_terminal_by_tty(tty, 30)
+                        if live_output and ScreenManager._looks_waiting(live_output):
                             status = "waiting"
-                            self.registry.update(session_id, status=status)
-                        elif any(x in live_output for x in ("❯", "plan mode", "Claude", "accept edits")):
-                            status = "idle"
-                            self.registry.update(session_id, status=status)
-                        output = live_output
-                        self.registry.update(session_id, last_output=output[-500:])
+                            output = (ts_text + "\n\n—— 待确认 ——\n" + live_output[-400:]) if ts_text else live_output[-600:]
+                    except Exception:
+                        pass
+            if output:
+                self.registry.update(session_id, status=status, last_output=output[-800:])
+            else:
+                self.registry.update(session_id, status=status)
+
+        if not used_authoritative:
+            # 回退：没有 per-process 状态文件（老版本 claude / 子代理），按类型走老逻辑
+            if stype == "ide":
+                try:
+                    ts_text, ts_iso = read_last_assistant_message(cwd, "", 1200)
+                    if ts_text:
+                        output = ts_text
+                    live_output, _ = self.ide_ctrl.read_output(s.get("app_name", ""), 50)
                 except Exception:
-                    pass
-        elif stype == "screen":
-            log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
-            import os
-            if os.path.exists(log_path):
-                live_output = self._read_log_output(log_path)
-                if live_output:
-                    output = live_output
+                    live_output = ""
+                if live_output and ScreenManager._looks_claude_terminal(live_output) \
+                        and ScreenManager._looks_waiting(live_output):
+                    status = "waiting"
+                    if live_output:
+                        output = (ts_text + "\n\n—— 待确认 ——\n" + live_output[-400:]) if ts_text else live_output[-600:]
+                elif ts_iso:
+                    import time as _time
+                    try:
+                        from datetime import datetime
+                        last = datetime.fromisoformat(ts_iso.replace("Z", "+00:00")).timestamp()
+                        status = "executing" if (_time.time() - last < 120) else "idle"
+                    except Exception:
+                        pass
+                if output:
+                    self.registry.update(session_id, status=status, last_output=output[-800:])
+                else:
+                    self.registry.update(session_id, status=status)
+            elif stype == "terminal":
+                tags = s.get("tags", {}) or {}
+                tty = tags.get("tty", "") if isinstance(tags, dict) else ""
+                read_via_tty = False
+                if tty:
+                    try:
+                        live_output, _ = self.ide_ctrl.read_terminal_by_tty(tty, 50)
+                        if live_output:
+                            read_via_tty = True
+                            output = live_output
+                            if ScreenManager._looks_waiting(live_output):
+                                status = "waiting"
+                            elif any(x in live_output for x in ("❯", "plan mode", "Claude", "accept edits", "$ ", "# ")):
+                                status = "idle"
+                            else:
+                                status = "executing"
+                            self.registry.update(session_id, status=status, last_output=output[-500:])
+                    except Exception:
+                        pass
+                if not read_via_tty:
+                    log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
+                    import os
+                    if os.path.exists(log_path):
+                        live_output = self._read_log_output(log_path)
+                        if live_output:
+                            output = live_output
+                            self.registry.update(session_id, last_output=output[-500:])
+            elif stype == "screen":
+                log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
+                import os
+                if os.path.exists(log_path):
+                    live_output = self._read_log_output(log_path)
+                    if live_output:
+                        output = live_output
 
         # Re-fetch to get updated status
         s = self.registry.get(session_id)

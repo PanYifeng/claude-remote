@@ -12,12 +12,139 @@ Provides:
 Requires: System Settings -> Privacy & Security -> Accessibility -> authorize python3
 """
 
+import json
 import logging
+import os
 import re
 import subprocess
 from typing import Optional
 
 logger = logging.getLogger("ide_control")
+
+
+def read_claude_session_state(pid: int) -> Optional[dict]:
+    """读取 Claude Code 的 per-process 状态文件 ~/.claude/sessions/<pid>.json
+
+    Claude Code 会把每个进程的当前状态写到这个文件，包含：
+    - sessionId: 会话 ID（对应 transcript 文件名，精确匹配，不会张冠李戴）
+    - status: 实时状态（busy / shell / idle / 等，比抓屏可靠）
+    - cwd, startedAt, name, version 等
+
+    Args:
+        pid: claude 进程 pid
+
+    Returns:
+        状态 dict，或 None（文件不存在 / 读失败）
+    """
+    if not pid:
+        return None
+    p = os.path.join(os.path.expanduser("~"), ".claude", "sessions", f"{pid}.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# Claude Code 的 status 字段 → 我们的会话状态
+CLAUDE_STATUS_MAP = {
+    "busy": "executing",
+    "shell": "idle",
+    "idle": "idle",
+    "waiting": "waiting",
+    "waiting_for_input": "waiting",
+    "input_required": "waiting",
+    "prompt": "waiting",
+}
+
+
+def map_claude_status(claude_status: str) -> Optional[str]:
+    """把 Claude Code 的 status 映射为我们的状态，未知返回 None"""
+    if not claude_status:
+        return None
+    return CLAUDE_STATUS_MAP.get(claude_status)
+
+
+def _read_last_assistant_from_file(fp: str, max_chars: int) -> tuple[str, str]:
+    """从单个 transcript .jsonl 读取最后一条 assistant 文本消息
+
+    Returns: (text, timestamp_iso)
+    """
+    try:
+        r = subprocess.run(
+            ["tail", "-n", "500", fp],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return "", ""
+    last_ts = ""
+    last_txt = ""
+    for ln in r.stdout.splitlines():
+        try:
+            o = json.loads(ln)
+        except Exception:
+            continue
+        msg = o.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        txt = ""
+        if isinstance(content, str):
+            txt = content
+        elif isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    txt += c.get("text", "")
+        if txt.strip():
+            last_ts = o.get("timestamp", "")
+            last_txt = txt
+    if not last_txt:
+        return "", ""
+    return last_txt[:max_chars], last_ts
+
+
+def read_last_assistant_message(cwd: str, session_id: str = "", max_chars: int = 1200) -> tuple[str, str]:
+    """从 Claude Code 本地 transcript 读取最近一条 assistant 文本消息
+
+    - 传入 session_id 时：精确读取该会话的 transcript 文件（推荐，配合
+      read_claude_session_state 拿到的 sessionId 使用，不会张冠李戴）。
+    - 不传 session_id 时：扫描项目目录所有 .jsonl，取"最近一条 assistant
+      消息时间戳最大"的文件（启发式，多会话同项目时可能选错，仅作回退）。
+
+    Args:
+        cwd: claude 进程工作目录
+        session_id: 精确会话 ID（可选）
+        max_chars: 最多返回字符数
+
+    Returns:
+        (text, timestamp_iso)，失败返回 ("", "")
+    """
+    if not cwd:
+        return "", ""
+    home = os.path.expanduser("~")
+    encoded = cwd.replace("/", "-")
+    proj_dir = os.path.join(home, ".claude", "projects", encoded)
+    if not os.path.isdir(proj_dir):
+        return "", ""
+
+    if session_id:
+        fp = os.path.join(proj_dir, f"{session_id}.jsonl")
+        return _read_last_assistant_from_file(fp, max_chars)
+
+    # 启发式回退：扫描所有 .jsonl，取 last-assistant-timestamp 最大的
+    best_ts = ""
+    best_txt = ""
+    try:
+        files = [f for f in os.listdir(proj_dir) if f.endswith(".jsonl")]
+    except Exception:
+        return "", ""
+    for fn in files:
+        fp = os.path.join(proj_dir, fn)
+        txt, ts = _read_last_assistant_from_file(fp, max_chars)
+        if ts and ts > best_ts:
+            best_ts = ts
+            best_txt = txt
+    return best_txt, best_ts
 
 # Known IDE process names on macOS
 IDE_PROCESS_NAMES = {
@@ -276,32 +403,105 @@ class IDEControl:
             logger.warning("read_terminal_by_app(%s) failed: %s", app_name, e)
             return "", 0
 
-    def read_terminal_full_output(self, lines: int = 50) -> tuple[str, int]:
-        """Read macOS Terminal.app full scrollback via clipboard"""
-        saved = self._get_clipboard()
+    def read_terminal_by_tty(self, tty: str, lines: int = 50) -> tuple[str, int]:
+        """Read Terminal.app tab content by matching its TTY
+
+        Iterates all Terminal windows/tabs and returns the `contents` of the
+        tab whose `tty` matches. This is non-invasive: no activation, no
+        clipboard, no focus stealing — and it reads the EXACT tab for this
+        session, not whichever terminal happens to be frontmost.
+
+        Args:
+            tty: TTY device name (e.g. "ttys005")
+            lines: Number of tail lines to return
+
+        Returns:
+            (output_text, line_count)
+        """
+        if not tty:
+            return "", 0
+        # AppleScript 中字符串转义
+        tty_esc = tty.replace('"', '\\"')
+        # 注意：`contents of t` 会与 AppleScript 保留字 contents（解引用运算符）冲突，
+        # 返回 tab 对象引用而非文本。必须用 `tell tab <i> of window <j> to set c to contents`
+        # 这种显式索引引用形式才能取到 tab 的 contents 文本属性。
+        # tty of t 返回 "/dev/ttys007"，需去掉 "/dev/" 前缀与 ps 输出对齐。
+        script = f"""
+        set targetTTY to "{tty_esc}"
+        tell application "Terminal"
+            set wCount to count of windows
+            repeat with wi from 1 to wCount
+                try
+                    set w to window wi
+                    set tCount to count of tabs of w
+                    repeat with ti from 1 to tCount
+                        set theTab to tab ti of w
+                        set tabTTY to tty of theTab
+                        if tabTTY starts with "/dev/" then
+                            set tabTTY to text 6 thru -1 of tabTTY
+                        end if
+                        if tabTTY is targetTTY then
+                            tell tab ti of window wi to set c to contents
+                            return c as text
+                        end if
+                    end repeat
+                end try
+            end repeat
+            return ""
+        end tell
+        """
         try:
-            script = """
-            tell application "Terminal"
-                activate
-            end tell
-            delay 0.1
-            tell application "System Events"
-                tell process "Terminal"
-                    set frontmost to true
-                    delay 0.05
-                    keystroke "a" using command down
-                end tell
-            end tell
-            delay 0.1
-            tell application "System Events"
-                tell process "Terminal"
-                    keystroke "c" using command down
-                end tell
-            end tell
-            """
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=8,
+            )
+        except Exception as e:
+            logger.warning("read_terminal_by_tty(%s) failed: %s", tty, e)
+            return "", 0
+        if result.returncode != 0:
+            logger.warning("read_terminal_by_tty(%s) osascript error: %s", tty, result.stderr.strip())
+            return "", 0
+        text = result.stdout
+        if not text:
+            return "", 0
+        # Terminal 的 contents 末尾常带一个空行，去掉
+        text = text.rstrip("\n")
+        line_count = len(text.splitlines())
+        if line_count > lines:
+            text = "\n".join(text.splitlines()[-lines:])
+            line_count = lines
+        return text, line_count
+
+    def read_terminal_full_output(self, lines: int = 50) -> tuple[str, int]:
+        """Read macOS Terminal.app full scrollback via clipboard
+
+        Uses a single AppleScript call: activate -> Cmd+A -> Cmd+C.
+        Split osascript calls lose focus between invocations.
+
+        Only call on user demand (/status), NOT in health check loop.
+        """
+        saved = self._get_clipboard()
+        script = """tell application "Terminal"
+    activate
+end tell
+delay 0.4
+tell application "System Events"
+    tell process "Terminal"
+        set frontmost to true
+        delay 0.2
+        keystroke "a" using command down
+    end tell
+end tell
+delay 0.3
+tell application "System Events"
+    tell process "Terminal"
+        keystroke "c" using command down
+    end tell
+end tell"""
+        try:
             subprocess.run(
                 ["osascript", "-e", script],
-                capture_output=True, timeout=3,
+                capture_output=True, timeout=5,
             )
         except Exception:
             pass
@@ -325,13 +525,17 @@ class IDEControl:
     def read_output(self, app_name: str, lines: int = 50) -> tuple[str, int]:
         """Read IDE terminal output via Select All -> Copy -> Clipboard
 
-        Single AppleScript: activate -> Cmd+A -> Cmd+C.
-        Does NOT press F12/Alt+F12 as those are unreliable across IDE versions.
+        流程：activate -> 聚焦终端区域 -> Cmd+A -> Cmd+C -> 读剪贴板。
 
-        The caller must check if the output looks like terminal content
-        (via _looks_waiting, presence of ❯, Claude UI patterns) vs editor content.
+        聚焦策略（解决之前抓到编辑器内容/抓空的问题）：
+        1. 优先找"Claude Code 工具窗口"组（Claude Code 插件），set focused 聚焦它。
+           —— 已验证：set focused of <group> to true 能让插件面板获得焦点，
+           不会像 Alt+F12 那样在已打开时反关闭。
+        2. 兜底：点击左工具栏的"终端/Terminal"按钮（内置终端场景），AXPress 打开/聚焦。
+        3. 都找不到就退化为只 activate + Cmd+A + Cmd+C。
 
-        Requires Accessibility permission and clipboard access.
+        调用方需自行判断输出是否为终端内容（含 ❯、Claude UI 等标记），
+        否则可能是编辑器内容，应丢弃。
 
         Args:
             app_name: Application display name (e.g. 'IntelliJ IDEA')
@@ -345,61 +549,66 @@ class IDEControl:
         process = self._app_to_process(app_name)
         proc = process or app_name
 
-        # Single AppleScript: activate -> F12 x2 (toggle terminal open) -> Cmd+A -> Cmd+C
-        # F12 toggles the terminal panel in IntelliJ-based IDEs. Pressing it twice
-        # ensures the terminal is visible regardless of its prior state.
-        # For VS Code/Cursor, use Ctrl+` instead of F12.
-        if proc in ("idea", "pycharm", "webstorm"):
-            # IntelliJ-based: just activate + Cmd+A + Cmd+C.
-            # No Alt+F12/F12 — they TOGGLE the terminal panel, so if it's
-            # already open they close it, making things worse.
-            # If the terminal panel is already visible, this captures it.
-            # If the editor is focused, it captures editor content — which
-            # _cmd_status detects (no ❯/Claude patterns) and ignores.
-            lines_raw = [
-                'tell application "' + app_name + '"',
-                '    activate',
-                'end tell',
-                'delay 0.3',
-                'tell application "System Events"',
-                '    tell process "' + proc + '"',
-                '        set frontmost to true',
-                '        delay 0.15',
-                '        keystroke "a" using command down',
-                '    end tell',
-                'end tell',
-                'delay 0.2',
-                'tell application "System Events"',
-                '    tell process "' + proc + '"',
-                '        keystroke "c" using command down',
-                '    end tell',
-                'end tell',
-            ]
-        else:
-            lines_raw = [
-                'tell application "' + app_name + '"',
-                '    activate',
-                'end tell',
-                'delay 0.3',
-                'tell application "System Events"',
-                '    tell process "' + proc + '"',
-                '        set frontmost to true',
-                '        delay 0.15',
-                '        keystroke "a" using command down',
-                '    end tell',
-                'end tell',
-                'delay 0.2',
-                'tell application "System Events"',
-                '    tell process "' + proc + '"',
-                '        keystroke "c" using command down',
-                '    end tell',
-                'end tell',
-            ]
-        script = '\n'.join(lines_raw)
+        # AppleScript 里先清空剪贴板，便于判断 Cmd+C 是否真的复制到了新内容
+        script = (
+            'tell application "' + app_name + '"\n'
+            '    activate\n'
+            'end tell\n'
+            'delay 0.3\n'
+            'tell application "System Events"\n'
+            '    tell process "' + proc + '"\n'
+            '        set frontmost to true\n'
+            '        delay 0.15\n'
+            '        -- 1. 尝试聚焦 Claude Code 工具窗口组（插件场景）\n'
+            '        set ccFound to false\n'
+            '        try\n'
+            '            set w to front window\n'
+            '            set root to UI element 1 of w\n'
+            '            repeat with ui in UI elements of root\n'
+            '                try\n'
+            '                    if (description of ui) contains "Claude Code" then\n'
+            '                        set focused of ui to true\n'
+            '                        set ccFound to true\n'
+            '                        exit repeat\n'
+            '                    end if\n'
+            '                end try\n'
+            '            end repeat\n'
+            '        end try\n'
+            '        -- 2. 兜底：点击左工具栏的终端按钮（内置终端场景）\n'
+            '        if not ccFound then\n'
+            '            try\n'
+            '                repeat with ui in UI elements of root\n'
+            '                    if (description of ui) contains "工具栏" or (description of ui) contains "toolbar" then\n'
+            '                        repeat with b in UI elements of ui\n'
+            '                            try\n'
+            '                                set bd to (description of b)\n'
+            '                                if bd contains "终端" or bd contains "Terminal" then\n'
+            '                                    perform action "AXPress" of b\n'
+            '                                    exit repeat\n'
+            '                                end if\n'
+            '                            end try\n'
+            '                        end repeat\n'
+            '                        exit repeat\n'
+            '                    end if\n'
+            '                end repeat\n'
+            '            end try\n'
+            '        end if\n'
+            '        delay 0.3\n'
+            '        keystroke "a" using command down\n'
+            '    end tell\n'
+            'end tell\n'
+            'delay 0.2\n'
+            'tell application "System Events"\n'
+            '    tell process "' + proc + '"\n'
+            '        keystroke "c" using command down\n'
+            '    end tell\n'
+            'end tell\n'
+            'delay 0.2\n'
+        )
         try:
             subprocess.run(
                 ["osascript", "-e", script],
-                capture_output=True, timeout=10,
+                capture_output=True, timeout=12,
             )
         except Exception:
             pass

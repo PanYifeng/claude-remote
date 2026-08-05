@@ -191,7 +191,7 @@ def register_session(proc: dict, kind: str, app_name: str) -> str | None:
         "pid": proc["pid"],
         "session_type": session_type,
         "app_name": app_name,
-        "tags": {"registered_by": "scan-existing", "original_pid": proc["pid"]},
+        "tags": {"registered_by": "scan-existing", "original_pid": proc["pid"], "tty": proc.get("tty", "")},
     }
 
     try:

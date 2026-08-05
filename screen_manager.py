@@ -371,5 +371,22 @@ class ScreenManager:
 
         return False
 
+    @staticmethod
+    def _looks_claude_terminal(output: str) -> bool:
+        """判断输出是否像 Claude Code 终端内容（而非 IDE 编辑器内容）
+
+        用于 IDE 会话读取后区分：是 Claude UI 文本（可用）还是代码/编辑器内容（应丢弃）。
+        """
+        if not output:
+            return False
+        # Claude Code UI 的特征标记
+        markers = (
+            "❯", "⏵", "accept edits", "esc to interrupt", "ctrl+t to hide tasks",
+            "↓ to manage", "shells,", "tokens", "thinking", "Marinating", "Cooked",
+            "plan mode", "Do you want to proceed", "Esc to cancel", "Enter to confirm",
+            "recap:", "new task?", "/clear to",
+        )
+        return any(m in output for m in markers)
+
 
 screen_manager = ScreenManager()
