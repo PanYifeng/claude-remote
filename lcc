@@ -1,11 +1,11 @@
 #!/bin/bash
 # lcc - Claude Code Remote Control Wrapper
 #
-# 包装 claude 命令，启动 screen 会话并通过 daemon 注册远程控制。
+# 包装 claude 命令，启动 tmux 会话并通过 daemon 注册远程控制。
 # 安装: sudo cp lcc /usr/local/bin/lcc && chmod +x /usr/local/bin/lcc
 #
 # 使用:
-#   lcc                    # 启动后台 claude 会话（可 screen -r 附接查看）
+#   lcc                    # 启动后台 claude 会话（可 tmux attach -t claude-<id> 附接查看）
 #   lcc --foreground       # 在当前终端启动（等同直接运行 claude）
 #   lcc --name "论文搜索"  # 指定会话名称
 #   lcc --help             # 显示帮助
@@ -15,7 +15,7 @@ set -euo pipefail
 # ── 配置 ──────────────────────────────────────────────
 DAEMON_URL="${CCR_DAEMON_URL:-http://localhost:9998}"
 UUID="${CCR_SESSION_ID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}"
-SCREEN_NAME="claude-${UUID:0:12}"
+TMUX_NAME="claude-${UUID:0:12}"
 CWD="$(pwd)"
 LOG_FILE="/tmp/claude-${UUID}.log"
 SESSION_NAME=""
@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
             echo "  CCR_DAEMON_URL      Daemon 地址 (默认: http://localhost:9998)"
             echo "  CCR_SESSION_ID      手动指定 session ID（默认自动生成）"
             echo ""
-            echo "后台模式: screen -r claude-<id> 可附接查看"
+            echo "后台模式: tmux attach -t claude-<id> 可附接查看"
             echo ""
             echo "示例:"
             echo "  lcc                          # 启动后台 claude"
@@ -76,11 +76,11 @@ register_session() {
 
 # ── 心跳循环（后台模式使用） ──────────────────────
 heartbeat_loop() {
-    # 等待屏幕会话启动
+    # 等待 tmux 会话启动
     sleep 1
     while true; do
-        # 检查 screen 是否存在
-        if ! screen -S "${SCREEN_NAME}" -Q select . >/dev/null 2>&1; then
+        # 检查 tmux 会话是否存在
+        if ! tmux has-session -t "${TMUX_NAME}" 2>/dev/null; then
             break
         fi
         # 发送心跳
@@ -103,31 +103,23 @@ trap cleanup EXIT
 register_session
 
 if $FOREGROUND; then
-    # 前台模式：直接在当前终端运行 claude
-    # 仍然创建 screen 并注册，但保持前台
+    # 前台模式：直接在当前终端运行 claude（不建 tmux 会话）
     echo "lcc: Starting claude (foreground mode) — session: ${UUID:0:8}"
-    # 启动 heartbeat 后台
-    heartbeat_loop &
-    HEARTBEAT_PID=$!
-    # 确实运行 claude（同时捕获输出用于监控）
+    # 捕获输出用于监控；退出时由 trap cleanup 注销 session
     script -q "${LOG_FILE}" claude "$@"
-    wait $HEARTBEAT_PID 2>/dev/null || true
 else
-    # 后台模式：创建 screen detached session
-    echo "lcc: Starting claude in screen session: ${SCREEN_NAME}"
-    echo "     Attach: screen -r ${SCREEN_NAME}"
+    # 后台模式：创建 detached tmux 会话
+    echo "lcc: Starting claude in tmux session: ${TMUX_NAME}"
+    echo "     Attach: tmux attach -t ${TMUX_NAME}"
     echo "     Session ID: ${UUID:0:8}"
 
     # 清空日志
     : > "${LOG_FILE}"
 
-    # 在 detached screen 中启动 claude
-    screen -dmS "${SCREEN_NAME}" bash -c "
-        cd '${CWD}'
-        : > '${LOG_FILE}'
-        script -q -a '${LOG_FILE}' -c 'claude $*'
-    "
+    # 在 detached tmux 中启动 claude（script 捕获输出到日志，供 /status 读取）
+    tmux new-session -d -s "${TMUX_NAME}" \
+        "cd '${CWD}' && : > '${LOG_FILE}' && script -q -a '${LOG_FILE}' -c 'claude $*'"
 
-    # 心跳循环（阻塞，直到退出）
+    # 心跳循环（阻塞，直到 tmux 会话退出）
     heartbeat_loop
 fi

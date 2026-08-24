@@ -21,6 +21,7 @@ from config import config
 from registry import SessionRegistry
 from screen_manager import ScreenManager
 from ide_control import IDEControl
+from dispatch import send_to_session
 from lark_card import (
     session_list_card,
     session_status_card,
@@ -682,13 +683,7 @@ class LarkBot:
         s = self.registry.get(session_id)
         if not s:
             return "❌ Session no longer exists"
-        stype = s.get("session_type", "screen")
-        if stype == "ide":
-            ok = self.ide_ctrl.send_keys(s.get("app_name", ""), text)
-        elif stype == "terminal":
-            ok = self.ide_ctrl.send_keys(s.get("app_name", "") or "Terminal", text)
-        else:
-            ok = await self.screen_mgr.send_keys(session_id, text)
+        ok = await self._dispatch_send(s, "send", text)
         if ok:
             self.registry.update(session_id, status="running")
             _session_context.setdefault(chat_id, {})["selected"] = session_id
@@ -707,13 +702,7 @@ class LarkBot:
         s = self.registry.get(session_id)
         if not s:
             return "❌ Session no longer exists"
-        stype = s.get("session_type", "screen")
-        if stype == "ide":
-            ok = self.ide_ctrl.send_enter(s.get("app_name", ""))
-        elif stype == "terminal":
-            ok = self.ide_ctrl.send_enter(s.get("app_name", "") or "Terminal")
-        else:
-            ok = await self.screen_mgr.send_enter(session_id)
+        ok = await self._dispatch_send(s, "enter")
         if ok:
             self.registry.update(session_id, status="running")
             return f"✅ Confirmed `{session_id[:8]}`"
@@ -732,14 +721,8 @@ class LarkBot:
         s = self.registry.get(session_id)
         if not s:
             return "❌ Session no longer exists"
-        stype = s.get("session_type", "screen")
-        if stype in ("ide", "terminal"):
-            app = s.get("app_name") or ("Terminal" if stype == "terminal" else "")
-            ok = self.ide_ctrl.send_text(app, str(option))
-            if ok:
-                self.ide_ctrl.send_enter(app)
-        else:
-            ok = await self.screen_mgr.select_option(session_id, option)
+        # select = 发送"选项号 + 回车"，三类会话语义一致（terminal 按 tty 定位 tab）
+        ok = await self._dispatch_send(s, "send", str(option))
         if ok:
             self.registry.update(session_id, status="running")
             return f"✅ Selected option {option} → `{session_id[:8]}`"
@@ -757,13 +740,7 @@ class LarkBot:
         s = self.registry.get(session_id)
         if not s:
             return "❌ Session no longer exists"
-        stype = s.get("session_type", "screen")
-        if stype == "ide":
-            ok = self.ide_ctrl.send_ctrl_c(s.get("app_name", ""))
-        elif stype == "terminal":
-            ok = self.ide_ctrl.send_ctrl_c(s.get("app_name", "") or "Terminal")
-        else:
-            ok = await self.screen_mgr.send_ctrl_c(session_id)
+        ok = await self._dispatch_send(s, "ctrl_c")
         if ok:
             self.registry.update(session_id, status="running")
             return f"⚠️ Interrupted `{session_id[:8]}`"
@@ -780,8 +757,7 @@ class LarkBot:
             return "❌ Session no longer exists"
         stype = s.get("session_type", "screen")
         if stype in ("ide", "terminal"):
-            app = s.get("app_name") or ("Terminal" if stype == "terminal" else "")
-            self.ide_ctrl.send_ctrl_c(app)
+            await self._dispatch_send(s, "ctrl_c")
         else:
             await self.screen_mgr.send_ctrl_c(session_id)
             await asyncio.sleep(0.5)
@@ -846,6 +822,15 @@ class LarkBot:
 
     # ── Helpers ───────────────────────────────────────
 
+    async def _dispatch_send(self, s: dict, action: str, text: str = "") -> bool:
+        """按 session_type 路由发送动作（send=文本+回车 / enter / ctrl_c）
+
+        实际路由逻辑见 dispatch.send_to_session（lark_bot 与 daemon 共用）。
+        terminal 类型按 tags.tty 精确定位 Terminal.app 的对应 tab，避免击键落到
+        最前面的 tab（修复 /send 把消息发错会话的问题）。
+        """
+        return await send_to_session(self.ide_ctrl, self.screen_mgr, s, action, text)
+
     async def _resolve_target(self, arg: str, chat_id: str) -> Optional[str]:
         ctx = _session_context.get(chat_id)
         if not ctx:
@@ -905,26 +890,14 @@ class LarkBot:
 
     async def _confirm_from_bot(self, s: dict) -> bool:
         session_id = s["id"]
-        stype = s.get("session_type", "screen")
-        if stype == "ide":
-            ok = self.ide_ctrl.send_enter(s.get("app_name", ""))
-        elif stype == "terminal":
-            ok = self.ide_ctrl.send_enter(s.get("app_name", "") or "Terminal")
-        else:
-            ok = await self.screen_mgr.send_enter(session_id)
+        ok = await self._dispatch_send(s, "enter")
         if ok:
             self.registry.update(session_id, status="running")
         return ok
 
     async def _interrupt_from_bot(self, s: dict) -> bool:
         session_id = s["id"]
-        stype = s.get("session_type", "screen")
-        if stype == "ide":
-            ok = self.ide_ctrl.send_ctrl_c(s.get("app_name", ""))
-        elif stype == "terminal":
-            ok = self.ide_ctrl.send_ctrl_c(s.get("app_name", "") or "Terminal")
-        else:
-            ok = await self.screen_mgr.send_ctrl_c(session_id)
+        ok = await self._dispatch_send(s, "ctrl_c")
         if ok:
             self.registry.update(session_id, status="running")
         return ok
@@ -934,8 +907,7 @@ class LarkBot:
         stype = s.get("session_type", "screen")
         pid = s.get("pid", 0)
         if stype in ("ide", "terminal"):
-            app = s.get("app_name") or ("Terminal" if stype == "terminal" else "")
-            self.ide_ctrl.send_ctrl_c(app)
+            await self._dispatch_send(s, "ctrl_c")
             # 实际杀掉进程 — send_ctrl_c 只发送 Ctrl+C，进程可能不退出
             if pid:
                 try:

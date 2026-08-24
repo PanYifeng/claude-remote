@@ -28,6 +28,7 @@ from lark_bot import LarkBot
 from registry import SessionRegistry
 from screen_manager import ScreenManager
 from ide_control import ide_control, read_claude_session_state, map_claude_status
+from dispatch import send_to_session
 
 
 def setup_logging() -> None:
@@ -119,67 +120,25 @@ class Daemon:
         logger.info("Session deleted: %s", session_id[:8])
         return self._json({"ok": True})
 
-    def _get_app_name(self, session):
-        return session.get("app_name") or session.get("win_title", "")
-
     async def _send_cmd(self, session, text):
-        stype = session.get("session_type", "screen")
-        if stype == "ide":
-            return self.ide_ctrl.send_keys(self._get_app_name(session), text)
-        elif stype == "terminal":
-            return self.ide_ctrl.send_keys(session.get("app_name") or "Terminal", text)
-        elif stype == "screen":
-            return await self.screen_mgr.send_keys(session["id"], text)
-        else:
-            ok = await self.screen_mgr.send_keys(session["id"], text)
-            if ok: return True
-            app = self._get_app_name(session)
-            return self.ide_ctrl.send_keys(app, text) if app else False
+        return await send_to_session(self.ide_ctrl, self.screen_mgr, session, "send", text)
 
     async def _confirm_cmd(self, session):
-        stype = session.get("session_type", "screen")
-        if stype == "ide":
-            return self.ide_ctrl.send_enter(self._get_app_name(session))
-        elif stype == "terminal":
-            return self.ide_ctrl.send_enter(session.get("app_name") or "Terminal")
-        elif stype == "screen":
-            return await self.screen_mgr.send_enter(session["id"])
-        else:
-            ok = await self.screen_mgr.send_enter(session["id"])
-            if ok: return True
-            app = self._get_app_name(session)
-            return self.ide_ctrl.send_enter(app) if app else False
+        return await send_to_session(self.ide_ctrl, self.screen_mgr, session, "enter")
 
     async def _interrupt_cmd(self, session):
-        stype = session.get("session_type", "screen")
-        if stype == "ide":
-            return self.ide_ctrl.send_ctrl_c(self._get_app_name(session))
-        elif stype == "terminal":
-            return self.ide_ctrl.send_ctrl_c(session.get("app_name") or "Terminal")
-        elif stype == "screen":
-            return await self.screen_mgr.send_ctrl_c(session["id"])
-        else:
-            ok = await self.screen_mgr.send_ctrl_c(session["id"])
-            if ok: return True
-            app = self._get_app_name(session)
-            return self.ide_ctrl.send_ctrl_c(app) if app else False
+        return await send_to_session(self.ide_ctrl, self.screen_mgr, session, "ctrl_c")
 
     async def _select_cmd(self, session, option):
-        stype = session.get("session_type", "screen")
-        if stype in ("ide", "terminal"):
-            app = session.get("app_name") or ("Terminal" if stype == "terminal" else "")
-            ok = self.ide_ctrl.send_text(app, str(option))
-            if ok: self.ide_ctrl.send_enter(app)
-            return ok
-        return await self.screen_mgr.select_option(session["id"], option)
+        # select = 发"选项号+回车"，三类会话语义一致（terminal 按 tty 定位 tab）
+        return await send_to_session(self.ide_ctrl, self.screen_mgr, session, "send", str(option))
 
     async def _stop_cmd(self, session):
         stype = session.get("session_type", "screen")
         pid = session.get("pid", 0)
-        if stype in ("ide", "terminal"):
-            app = session.get("app_name") or ("Terminal" if stype == "terminal" else "")
-            self.ide_ctrl.send_ctrl_c(app)
-            # Also kill the actual process
+        if stype in ("ide", "terminal", "standalone"):
+            # 先发 Ctrl+C，再 kill 进程确保退出
+            await send_to_session(self.ide_ctrl, self.screen_mgr, session, "ctrl_c")
             if pid:
                 try:
                     proc = await asyncio.create_subprocess_exec(

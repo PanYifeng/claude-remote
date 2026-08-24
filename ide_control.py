@@ -65,6 +65,23 @@ def map_claude_status(claude_status: str) -> Optional[str]:
     return CLAUDE_STATUS_MAP.get(claude_status)
 
 
+def session_tty(session: dict) -> str:
+    """从 session 记录中提取 TTY 设备名（用于按 TTY 精确定位 Terminal.app 的 tab）
+
+    session 的 tags 可能是 dict（register 返回）或 JSON 字符串（get/list 返回），
+    此函数统一处理。返回如 "ttys005"；无则空串。
+    """
+    tags = session.get("tags", {})
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except (json.JSONDecodeError, ValueError):
+            return ""
+    if isinstance(tags, dict):
+        return tags.get("tty", "") or ""
+    return ""
+
+
 def _read_last_assistant_from_file(fp: str, max_chars: int) -> tuple[str, str]:
     """从单个 transcript .jsonl 读取最后一条 assistant 文本消息
 
@@ -323,7 +340,7 @@ class IDEControl:
             return False
 
     def send_ctrl_c(self, app_name: str) -> bool:
-        """Send Ctrl+C"""
+        """Send Ctrl+C (SIGINT, 中断前台进程)"""
         script = f"""
         tell application "{app_name}"
             activate
@@ -331,7 +348,7 @@ class IDEControl:
         delay 0.1
         tell application "System Events"
             tell process "{app_name}"
-                key code 8 using command down
+                key code 8 using control down
             end tell
         end tell
         """
@@ -343,6 +360,97 @@ class IDEControl:
             return True
         except Exception:
             return False
+
+    def _send_to_terminal_tty(self, tty: str, keystroke_lines: str) -> bool:
+        """向 Terminal.app 中匹配 tty 的 tab 发送击键（单次 osascript）
+
+        复用 read_terminal_by_tty 的 tab 定位循环：找到匹配 tab 后选定该 tab、把
+        所在窗口提到最前、激活 Terminal.app，再执行击键——确保击键落到目标会话
+        而非任意最前面的 tab。找不到匹配 tab 时不发送任何击键（返回 False），避免
+        误发到其它会话。单次 osascript 是必须的：分次调用会在调用间丢焦点。
+
+        Args:
+            tty: TTY 设备名（如 "ttys005"）
+            keystroke_lines: 击键 AppleScript 片段，在 'tell process "Terminal"'
+                块内执行，如 'keystroke "ls"' 'keystroke return'
+
+        Returns:
+            True 已发送；False tab 未找到或发送失败
+        """
+        if not tty:
+            return False
+        tty_esc = tty.replace('"', '\\"')
+        script = f"""
+        set targetTTY to "{tty_esc}"
+        set didFind to false
+        tell application "Terminal"
+            set wCount to count of windows
+            repeat with wi from 1 to wCount
+                try
+                    set w to window wi
+                    set tCount to count of tabs of w
+                    repeat with ti from 1 to tCount
+                        set theTab to tab ti of w
+                        set tabTTY to tty of theTab
+                        if tabTTY starts with "/dev/" then
+                            set tabTTY to text 6 thru -1 of tabTTY
+                        end if
+                        if tabTTY is targetTTY then
+                            set selected tab of w to theTab
+                            set didFind to true
+                            try
+                                set index of w to 1
+                            end try
+                            exit repeat
+                        end if
+                    end repeat
+                end try
+                if didFind then exit repeat
+            end repeat
+        end tell
+        if not didFind then
+            return "CCR_TAB_NOT_FOUND"
+        end if
+        delay 0.25
+        tell application "Terminal" to activate
+        delay 0.15
+        tell application "System Events"
+            tell process "Terminal"
+                set frontmost to true
+                delay 0.1
+                {keystroke_lines}
+            end tell
+        end tell
+        return "CCR_OK"
+        """
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=8,
+            )
+        except Exception as e:
+            logger.warning("send_to_terminal_tty(%s) failed: %s", tty, e)
+            return False
+        if result.returncode != 0:
+            logger.warning("send_to_terminal_tty(%s) osascript error: %s", tty, result.stderr.strip())
+            return False
+        if result.stdout.strip() == "CCR_TAB_NOT_FOUND":
+            logger.warning("send_to_terminal_tty(%s): tab not found", tty)
+            return False
+        return True
+
+    def send_keys_to_tty(self, tty: str, text: str) -> bool:
+        """向 tty 对应的 Terminal tab 发送文本 + 回车"""
+        escaped = text.replace('"', '\\"')
+        return self._send_to_terminal_tty(tty, f'keystroke "{escaped}"\n            keystroke return')
+
+    def send_enter_to_tty(self, tty: str) -> bool:
+        """向 tty 对应的 Terminal tab 发送回车"""
+        return self._send_to_terminal_tty(tty, "keystroke return")
+
+    def send_ctrl_c_to_tty(self, tty: str) -> bool:
+        """向 tty 对应的 Terminal tab 发送 Ctrl+C（中断，SIGINT）"""
+        return self._send_to_terminal_tty(tty, "key code 8 using control down")
 
     def read_terminal_output(self, lines: int = 50) -> tuple[str, int]:
         """Read macOS Terminal.app visible content via AppleScript
