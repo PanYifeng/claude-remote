@@ -622,6 +622,7 @@ class Daemon:
         logger.info("Starting Lark event consume")
 
         while self._running:
+            proc = None
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "lark-cli", "event", "consume",
@@ -629,15 +630,17 @@ class Daemon:
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,  # 新进程组 → killpg 杀整棵树（node+lark-cli+_bus），防孤儿泄露
                 )
                 logger.info("Event consume started (PID: %d)", proc.pid)
-
-                # Keep stdin open explicitly — prevents GC from closing the pipe
-                stdin_keepalive = proc.stdin
+                stdin_keepalive = proc.stdin  # 防 GC 关 pipe（lark-cli 遇 stdin EOF 退出）
 
                 assert proc.stdout is not None
                 while self._running and proc.returncode is None:
-                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=600)
+                    try:
+                        line = await asyncio.wait_for(proc.stdout.readline(), timeout=600)
+                    except asyncio.TimeoutError:
+                        continue  # 10min 无事件，继续读同一 proc（旧代码此处抛到外层 except → 重新 spawn 新 proc，旧 proc 孤儿化 → 1818 泄露）
                     if not line:
                         break
                     raw = line.decode("utf-8", errors="replace").strip()
@@ -656,11 +659,26 @@ class Daemon:
                 await proc.wait()
                 logger.warning("Event consume exited (code: %d), restarting in 5s...", proc.returncode)
                 del stdin_keepalive
-            except asyncio.TimeoutError:
-                continue
+            except asyncio.CancelledError:
+                await self._kill_proc_tree(proc)  # task 取消（shutdown/restart）——杀整棵树防孤儿
+                raise
             except Exception as e:
                 logger.error("Event consume error: %s", e)
+                await self._kill_proc_tree(proc)
             await asyncio.sleep(5)
+
+    async def _kill_proc_tree(self, proc) -> None:
+        """杀整棵进程树（start_new_session 后 proc 是新进程组组长，killpg 杀全组：node+lark-cli+_bus）。"""
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
 
     async def start(self):
         self._start_time = time.time()
