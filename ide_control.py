@@ -255,7 +255,7 @@ class IDEControl:
         return False
 
     def send_keys(self, app_name: str, text: str) -> bool:
-        """Send text + Enter to IDE terminal via AppleScript keystroke
+        """Send text + Enter to IDE terminal (clipboard paste, supports CJK)
 
         Args:
             app_name: Process name (e.g. "IntelliJ IDEA", "Code")
@@ -264,7 +264,6 @@ class IDEControl:
         Returns:
             True if successful
         """
-        escaped = text.replace('"', '\\"')
         script = f"""
         tell application "{app_name}"
             activate
@@ -274,27 +273,30 @@ class IDEControl:
             tell process "{app_name}"
                 set frontmost to true
                 delay 0.1
-                keystroke "{escaped}"
+                keystroke "v" using command down
                 keystroke return
             end tell
         end tell
         """
-        try:
-            proc = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=5,
-            )
-            if proc.returncode != 0:
-                logger.warning("send_keys failed: %s", proc.stderr.strip())
+
+        def paste() -> bool:
+            try:
+                proc = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if proc.returncode != 0:
+                    logger.warning("send_keys failed: %s", proc.stderr.strip())
+                    return False
+                return True
+            except Exception as e:
+                logger.error("send_keys error: %s", e)
                 return False
-            return True
-        except Exception as e:
-            logger.error("send_keys error: %s", e)
-            return False
+
+        return self._with_clipboard_text(text, paste)
 
     def send_text(self, app_name: str, text: str) -> bool:
-        """Send plain text (no Enter appended)"""
-        escaped = text.replace('"', '\\"')
+        """Send plain text, no Enter appended (clipboard paste for CJK support)"""
         script = f"""
         tell application "{app_name}"
             activate
@@ -304,18 +306,22 @@ class IDEControl:
             tell process "{app_name}"
                 set frontmost to true
                 delay 0.1
-                keystroke "{escaped}"
+                keystroke "v" using command down
             end tell
         end tell
         """
-        try:
-            subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=5,
-            )
-            return True
-        except Exception:
-            return False
+
+        def paste() -> bool:
+            try:
+                subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True, text=True, timeout=5,
+                )
+                return True
+            except Exception:
+                return False
+
+        return self._with_clipboard_text(text, paste)
 
     def send_enter(self, app_name: str) -> bool:
         """Send Enter key"""
@@ -440,9 +446,13 @@ class IDEControl:
         return True
 
     def send_keys_to_tty(self, tty: str, text: str) -> bool:
-        """向 tty 对应的 Terminal tab 发送文本 + 回车"""
-        escaped = text.replace('"', '\\"')
-        return self._send_to_terminal_tty(tty, f'keystroke "{escaped}"\n            keystroke return')
+        """向 tty 对应的 Terminal tab 发送文本 + 回车
+
+        走剪贴板 Cmd+V 粘贴：keystroke 无法输入中文等多字节字符，会打成乱码，
+        必须用剪贴板绕过。
+        """
+        paste = "delay 0.1\n            keystroke \"v\" using command down\n            keystroke return"
+        return self._with_clipboard_text(text, lambda: self._send_to_terminal_tty(tty, paste))
 
     def send_enter_to_tty(self, tty: str) -> bool:
         """向 tty 对应的 Terminal tab 发送回车"""
@@ -760,6 +770,27 @@ end tell"""
             )
         except Exception:
             pass
+
+    def _with_clipboard_text(self, text: str, paste_action) -> bool:
+        """把 text 放到剪贴板、执行 paste_action() 粘贴、再还原剪贴板
+
+        用剪贴板 Cmd+V 粘贴代替 keystroke 文本：keystroke 无法对中文等多字节
+        字符生成键盘事件，会打成乱码（ASCII 正常）。paste_action 须在调用前
+        已聚焦目标窗口/tab，仅负责 Cmd+V 粘贴（和回车）。
+
+        Args:
+            text: 要粘贴的文本
+            paste_action: 无参可调用对象，执行实际粘贴，返回是否成功
+
+        Returns:
+            paste_action 的返回值
+        """
+        saved = self._get_clipboard()
+        self._set_clipboard(text)
+        try:
+            return paste_action()
+        finally:
+            self._set_clipboard(saved)
 
     @staticmethod
     def _read_tail(path: str, lines: int = 50) -> tuple[str, int]:
