@@ -118,6 +118,7 @@ ls -la      → sent to session
 - Use number shortcuts: `/confirm 1`, `/status 2`, `/send 3 pwd`
 - `/confirm` or `/interrupt` without ID acts on last session
 - `/new <path>` creates a tmux session + log file for accurate output reading
+- `/send` pastes via the clipboard (supports Chinese and other non-ASCII text; keystroke alone cannot type multibyte characters)
 - ID supports fuzzy matching — first 8 chars are sufficient
 - `/exit --kill` updates the last interactive card with stop status
 - `/status <id>` reads live terminal output for IDE sessions — detects waiting/idle/executing
@@ -167,7 +168,10 @@ Each session in `/l` shows:
 ├── screen_manager.py   # Tmux session lifecycle management (replaces macOS broken screen)
 ├── registry.py         # SQLite session registry
 ├── ide_control.py      # IDE terminal control via AppleScript
+├── dispatch.py         # Shared send/enter/ctrl-c router (used by lark_bot & daemon)
 ├── config.py           # Configuration from env vars
+├── lcc                 # Launcher — start a tmux + daemon-registered claude session
+├── ide-register        # Register an existing IDE/terminal claude session
 ├── scan-existing       # Scan & register existing claude processes with heartbeat daemon
 ├── LICENSE             # MIT License
 └── README.md           # This file
