@@ -63,6 +63,31 @@ python3 scan-existing
 python3 scan-existing --daemon
 ```
 
+### Start a session / 启动会话
+
+There are two ways to launch a claude session that the daemon can control:
+
+**Option A — `lcc` (recommended, full feature support)**
+
+`lcc` wraps `claude`: it starts a detached tmux session (so output is captured to a log file) and registers it with the daemon automatically. Sessions launched this way get streaming output and accurate `/status` (same as `/new`), because a log file exists.
+
+```bash
+# Install the wrapper somewhere on PATH
+sudo cp lcc /usr/local/bin/lcc && chmod +x /usr/local/bin/lcc
+
+# From the project directory you want claude to work in:
+lcc                      # background tmux session (detach, control from Lark)
+tmux attach -t claude-<id>   # optionally attach locally to watch
+
+lcc --name "论文搜索"     # name the session (shown in /l)
+lcc --foreground         # run in the current terminal instead of tmux
+lcc -- python train.py   # pass extra args to claude
+```
+
+**Option B — `scan-existing` (adopt already-running sessions)**
+
+If you already have claude running in a terminal or IDE, `scan-existing` discovers and registers those processes (run above). These native terminal/IDE sessions support `/send`, `/confirm`, `/interrupt` (terminal sessions are targeted by TTY) but have no log file, so no streaming output — use `/status <id>` to read live output on demand.
+
 ## Lark Bot Commands / 飞书机器人命令
 
 ### Session Management / 会话管理
@@ -184,6 +209,8 @@ Each session in `/l` shows:
 | `CCR_DAEMON_PORT` | `9998` | Daemon HTTP port |
 | `CCR_DATA_DIR` | `~/.claude-remote` | Data storage directory |
 | `CCR_LOG_PATH` | `/tmp/claude-daemon.log` | Log file path |
+| `CCR_DAEMON_URL` | `http://localhost:9998` | Daemon URL (used by `lcc`) |
+| `CCR_SESSION_ID` | auto (UUID) | Force a session ID (used by `lcc`) |
 | `LARK_APP_ID` | - | Lark App ID (required) |
 | `LARK_APP_SECRET` | - | Lark App Secret (required) |
 
