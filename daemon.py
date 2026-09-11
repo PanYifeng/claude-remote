@@ -27,7 +27,8 @@ from config import config
 from lark_bot import LarkBot
 from registry import SessionRegistry
 from screen_manager import ScreenManager
-from ide_control import ide_control, read_claude_session_state, map_claude_status
+from ide_control import ide_control
+from agent_state import read_agent_state
 from dispatch import send_to_session
 
 
@@ -95,8 +96,9 @@ class Daemon:
             cwd=data.get("cwd", ""), log_path=log_path,
             tags=data.get("tags"), session_type=session_type,
             app_name=data.get("app_name", ""), win_title=data.get("win_title", ""),
+            agent=data.get("agent", "claude"),
         )
-        logger.info("Session registered: %s (%s) type=%s", session_id[:8], data.get("name", ""), session_type)
+        logger.info("Session registered: %s (%s) type=%s agent=%s", session_id[:8], data.get("name", ""), session_type, data.get("agent", "claude"))
         return self._json({"ok": True, "session": session})
 
     async def handle_session_heartbeat(self, request):
@@ -326,6 +328,7 @@ class Daemon:
         for s in sessions:
             session_id = s["id"]
             stype = s.get("session_type", "screen")
+            agent = s.get("agent", "claude")
 
             if stype in ("ide", "terminal", "standalone"):
                 updated_at = s.get("updated_at", 0)
@@ -353,11 +356,9 @@ class Daemon:
                 # Terminal: read output and detect waiting vs executing vs idle
                 # NEVER read IDE output here (steals focus via Cmd+A/Cmd+C)
                 if stype == "terminal":
-                    # 优先用 Claude Code 的 per-process 状态文件（权威，非侵入）
-                    cs = read_claude_session_state(pid) if pid else None
-                    status = None
-                    if cs and cs.get("sessionId"):
-                        status = map_claude_status(cs.get("status", ""))
+                    # 优先用 agent 的权威状态（claude: per-process 状态文件；opencode: sqlite）
+                    st = read_agent_state(agent, pid, s.get("cwd", ""))
+                    status = st.status if (st and st.session_id) else None
                     if status:
                         # 有 log 文件的会话再补一刀 approval 提示检测（claude status 未必标 waiting）
                         log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
@@ -394,11 +395,9 @@ class Daemon:
                         logger.info("Session %s status: %s -> %s", session_id[:8], s.get("status"), status)
                     self.registry.update(session_id, status=status)
                 elif stype == "ide":
-                    # IDE 会话：用 Claude Code 的 per-process 状态文件判定（非侵入，不抢焦点）
-                    cs = read_claude_session_state(pid) if pid else None
-                    status = None
-                    if cs and cs.get("sessionId"):
-                        status = map_claude_status(cs.get("status", ""))
+                    # IDE 会话：用 agent 权威状态判定（非侵入，不抢焦点）
+                    st = read_agent_state(agent, pid, s.get("cwd", ""))
+                    status = st.status if (st and st.session_id) else None
                     if not status:
                         # 无状态文件：保留原状态（不抢焦点读屏）
                         status = s.get("status", "running")
@@ -412,6 +411,18 @@ class Daemon:
             if not alive:
                 self.registry.update(session_id, status="stopped")
                 logger.info("Session %s stopped (screen dead)", session_id[:8])
+                continue
+            # OpenCode：状态从 sqlite 读（tmux 日志是 TUI 乱码，不可用）
+            if agent == "opencode":
+                st = read_agent_state(agent, 0, s.get("cwd", ""))
+                status = st.status if (st and st.status) else s.get("status", "running")
+                text = st.text if st else ""
+                if status != s.get("status"):
+                    logger.info("Session %s status: %s -> %s", session_id[:8], s.get("status"), status)
+                if text:
+                    self.registry.update(session_id, status=status, last_output=text[-800:])
+                else:
+                    self.registry.update(session_id, status=status)
                 continue
             output, _ = await self.screen_mgr.read_output(session_id, 10)
             status = await self.screen_mgr.detect_status(session_id, pid=s.get("pid"), last_update=s.get("updated_at"))
@@ -434,7 +445,9 @@ class Daemon:
             if pid:
                 registered_pids.add(pid)
 
-        # 扫描当前 claude 进程
+        # 扫描当前 agent 进程（claude 与 opencode）
+        # 支持的 agent 二进制名
+        agent_binaries = {"claude", "opencode"}
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ps", "-eo", "pid,tty,comm",
@@ -442,16 +455,18 @@ class Daemon:
             )
             stdout, _ = await proc.communicate()
             claude_pids = set()
+            pid_agent_map: dict[int, str] = {}  # pid → agent 类型（claude/opencode）
             pid_tty_map: dict[int, str] = {}  # pid → tty，注册时存入 tags，便于按 TTY 定位终端 tab
             for line in stdout.decode().splitlines():
                 parts = line.strip().split(None, 2)
                 if len(parts) < 3:
                     continue
                 pid_str, tty, comm = parts
-                if comm == "claude" and tty != "??":
+                if comm in agent_binaries and tty != "??":
                     try:
                         pid = int(pid_str)
                         claude_pids.add(pid)
+                        pid_agent_map[pid] = comm
                         pid_tty_map[pid] = tty
                     except ValueError:
                         continue
@@ -580,14 +595,16 @@ class Daemon:
             tty = pid_tty_map.get(pid, "")
             if tty:
                 session_tags["tty"] = tty
+            agent = pid_agent_map.get(pid, "claude")
 
             self.registry.register(
                 session_id, screen_name,
                 name=name, pid=pid,
                 cwd=cwd, log_path=log_path,
                 tags=session_tags, session_type=stype, app_name=app_name,
+                agent=agent,
             )
-            logger.info("Auto-discovered new session: %s (%s) pid=%d type=%s", session_id[:8], name, pid, stype)
+            logger.info("Auto-discovered new session: %s (%s) pid=%d type=%s agent=%s", session_id[:8], name, pid, stype, agent)
 
         # 回填：已注册的 terminal session 如果 tags 里没有 tty，按 pid 补上
         for s in all_sessions:
@@ -599,7 +616,7 @@ class Daemon:
             spid = s.get("pid", 0)
             tty = pid_tty_map.get(spid, "")
             if not tty:
-                # pid_tty_map 只含 claude 进程；这里是回填，单独查一次 ps
+                # pid_tty_map 只含本轮发现的 agent 进程；这里是回填，单独查一次 ps
                 try:
                     tp = await asyncio.create_subprocess_exec(
                         "ps", "-p", str(spid), "-o", "tty=",

@@ -38,7 +38,8 @@ class SessionRegistry:
                         tags         TEXT DEFAULT '{}',
                         session_type TEXT DEFAULT 'screen',
                         app_name     TEXT DEFAULT '',
-                        win_title    TEXT DEFAULT ''
+                        win_title    TEXT DEFAULT '',
+                        agent        TEXT DEFAULT 'claude'
                     )
                 """)
                 # 数据库迁移：为旧版数据库添加新列（安全幂等）
@@ -46,6 +47,7 @@ class SessionRegistry:
                     ("session_type", "TEXT DEFAULT 'screen'"),
                     ("app_name", "TEXT DEFAULT ''"),
                     ("win_title", "TEXT DEFAULT ''"),
+                    ("agent", "TEXT DEFAULT 'claude'"),
                 ]:
                     try:
                         conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
@@ -68,6 +70,7 @@ class SessionRegistry:
         session_type: str = "screen",
         app_name: str = "",
         win_title: str = "",
+        agent: str = "claude",
     ) -> dict:
         """注册一个新的 session
 
@@ -102,6 +105,7 @@ class SessionRegistry:
             "session_type": session_type,
             "app_name": app_name,
             "win_title": win_title,
+            "agent": agent,
         }
         with self._lock:
             conn = sqlite3.connect(str(self._db_path))
@@ -110,10 +114,10 @@ class SessionRegistry:
                     """INSERT OR REPLACE INTO sessions
                        (id, name, screen_name, pid, cwd, log_path,
                         status, created_at, updated_at, last_output, tags,
-                        session_type, app_name, win_title)
+                        session_type, app_name, win_title, agent)
                        VALUES (:id, :name, :screen_name, :pid, :cwd, :log_path,
                                :status, :created_at, :updated_at, :last_output, :tags,
-                               :session_type, :app_name, :win_title)""",
+                               :session_type, :app_name, :win_title, :agent)""",
                     row,
                 )
                 conn.commit()

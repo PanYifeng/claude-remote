@@ -45,6 +45,7 @@ COMMAND_HELP = """
 /exit [--kill]                — Exit interactive mode (--kill also stops session)
 /ls [path]                    — List directory contents on host
 /new <path>                   — Start a new claude session in directory
+/new-opencode <path>          — Start a new opencode session in directory
 /pending                      — List sessions waiting for input
 /confirm-all                  — Confirm all waiting sessions
 /select <id|N> <n>            — Select option N
@@ -58,6 +59,7 @@ Tips:
   * `/exit` to leave interactive mode
   * `/ls` to browse directories on the host
   * `/new /path` to start a new claude session
+  * `/new-opencode /path` to start a new opencode session
 """
 
 
@@ -307,6 +309,7 @@ class LarkBot:
             "help": self._cmd_help,
             "enter": self._cmd_enter, "exit": self._cmd_exit,
             "new": self._cmd_new,
+            "new-opencode": self._cmd_new_opencode,
             "ls": self._cmd_ls,
             "daemon": self._cmd_daemon,
         }
@@ -336,31 +339,29 @@ class LarkBot:
         if not s:
             return "❌ Session no longer exists"
 
-        # 优先用 Claude Code 的 per-process 状态文件（权威：精确 sessionId + 实时 status）
+        # 优先用 agent 的权威状态（claude: per-process 状态文件；opencode: sqlite）
         stype = s.get("session_type", "screen")
         output = s.get("last_output", "")
         status = s.get("status", "running")
         cwd = s.get("cwd", "")
         pid = s.get("pid", 0)
+        agent = s.get("agent", "claude")
 
-        from ide_control import (read_claude_session_state, map_claude_status,
-                                  read_last_assistant_message)
+        from agent_state import read_agent_state
+        from ide_control import read_last_assistant_message
         from screen_manager import ScreenManager
 
-        cs = read_claude_session_state(pid) if pid else None
+        st = read_agent_state(agent, pid, cwd)
         used_authoritative = False
-        if cs and cs.get("sessionId"):
+        if st and st.session_id:
             used_authoritative = True
-            cs_sid = cs["sessionId"]
-            # 内容：精确 transcript（不会张冠李戴）
-            ts_text, _ = read_last_assistant_message(cwd, cs_sid, 1200)
+            ts_text = st.text
             if ts_text:
                 output = ts_text
-            # 状态：claude 实时状态（busy→executing, shell/idle→idle, waiting→waiting）
-            mapped = map_claude_status(cs.get("status", ""))
-            if mapped:
-                status = mapped
-            # 待确认补充：终端会话再按 TTY 抓一下，approval 提示未必反映在 status 字段
+            # 状态：agent 实时状态
+            if st.status:
+                status = st.status
+            # 待确认补充：终端会话再按 TTY 抓一下，approval 提示未必反映在状态里
             if stype == "terminal" and status != "waiting":
                 tags = s.get("tags", {}) or {}
                 tty = tags.get("tty", "") if isinstance(tags, dict) else ""
@@ -539,65 +540,109 @@ class LarkBot:
         if not os.path.isdir(path):
             return f"❌ Not a directory: `{path}`"
 
-        session_id = str(uuid.uuid4())
-        screen_name = f"claude-{session_id[:12]}"
-        log_path = f"/tmp/claude-{session_id}.log"
-        name = os.path.basename(path)
-
-        try:
-            pid = await self.screen_mgr.create(session_id, cwd=path, log_path=log_path)
-        except Exception as e:
-            return f"❌ Failed to create session: {e}"
+        session_id, log_path, pid = await self._create_screen_session(path, command="claude")
+        if session_id is None:
+            return f"❌ Failed to create session: {pid}"  # pid 复用为错误信息
 
         self.registry.register(
-            session_id, screen_name,
-            name=f"New — {name}", pid=pid,
+            session_id, f"claude-{session_id[:12]}",
+            name=f"New — {os.path.basename(path)}", pid=pid,
             cwd=path, log_path=log_path,
-            session_type="screen",
+            session_type="screen", agent="claude",
         )
 
-        # Wait for claude to start and auto-confirm trust prompt
-        # Claude takes ~30s to start on this machine
+        # 等待 claude 启动并自动确认 trust prompt（本机启动约 30s）
+        started = await self._wait_claude_trust_prompt(session_id, log_path)
+        status = "started" if started else "starting (may take a moment)"
+
+        self._enter_interactive_mode(session_id, path, chat_id, started)
+        return f"✅ New session in `{path}` ({status}).\nMessages you send will go to this session.\n`/exit` to leave."
+
+    async def _cmd_new_opencode(self, args: list[str], chat_id: str) -> str:
+        """Start a new opencode session in a directory and enter interactive mode"""
+        path = " ".join(args) if args else os.getcwd()
+        if not os.path.isdir(path):
+            return f"❌ Not a directory: `{path}`"
+
+        session_id, log_path, pid = await self._create_screen_session(path, command="opencode")
+        if session_id is None:
+            return f"❌ Failed to create session: {pid}"
+
+        self.registry.register(
+            session_id, f"claude-{session_id[:12]}",
+            name=f"OpenCode — {os.path.basename(path)}", pid=pid,
+            cwd=path, log_path=log_path,
+            session_type="screen", agent="opencode",
+        )
+
+        # opencode 无 trust prompt，稍等启动；状态由 daemon 从 sqlite 读
         import asyncio as _asyncio
-        started = False
-        for i in range(35):
+        await _asyncio.sleep(3)
+
+        self._enter_interactive_mode(session_id, path, chat_id, True)
+        return f"✅ OpenCode session in `{path}` (started).\nMessages you send will go to this session.\n`/exit` to leave."
+
+    async def _create_screen_session(self, path: str, command: str) -> tuple[Optional[str], str, int]:
+        """创建 detached tmux 会话运行指定 agent
+
+        Returns:
+            (session_id, log_path, pid)；失败返回 (None, "", 错误码)
+        """
+        session_id = str(uuid.uuid4())
+        log_path = f"/tmp/claude-{session_id}.log"
+        try:
+            pid = await self.screen_mgr.create(session_id, cwd=path, log_path=log_path, command=command)
+            return session_id, log_path, pid
+        except Exception as e:
+            logger.error("create screen session failed: %s", e)
+            return None, "", str(e)
+
+    async def _wait_claude_trust_prompt(self, session_id: str, log_path: str) -> bool:
+        """等待 claude 启动并自动确认 trust prompt（claude 专属）"""
+        import asyncio as _asyncio
+        import re
+        for _ in range(35):
             try:
                 if os.path.exists(log_path) and os.path.getsize(log_path) > 500:
                     with open(log_path, "rb") as f:
                         raw = f.read()
-                    import re
-                    text = raw.decode("utf-8", errors="replace")
-                    text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
-                    # Auto-confirm trust prompt
+                    text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', raw.decode("utf-8", errors="replace"))
                     if 'enter to confirm' in text.lower():
                         await self.screen_mgr.send_enter(session_id)
                         await _asyncio.sleep(3)
-                        started = True
-                        break
-                    started = True
-                    break
+                        return True
+                    return True
             except Exception:
                 pass
             await _asyncio.sleep(1)
+        return False
 
-        status = "started" if started else "starting (may take a moment)"
-
-        # Update list cache and enter interactive mode
+    def _enter_interactive_mode(self, session_id: str, path: str, chat_id: str, started: bool) -> None:
+        """更新列表缓存并进入交互模式"""
         ctx = _session_context.setdefault(chat_id, {})
         sessions = self.registry.list()
         ctx["sessions"] = [s["id"] for s in sessions]
         ctx["mode"] = session_id
         logger.info("New session + interactive mode: %s %s (ready=%s)", session_id[:8], path, started)
 
-        return f"✅ New session in `{path}` ({status}).\nMessages you send will go to this session.\n`/exit` to leave."
-
     async def _read_interactive_output(self, s: dict) -> str:
         """Read session output for interactive mode display
 
         Tries log file first (screen sessions via /new), then falls back
         to Terminal.app clipboard capture (reads frontmost window).
+        OpenCode 会话从 sqlite 读最近一条 assistant 文本（日志是 TUI 乱码，不可用）。
         """
         session_id = s["id"]
+        agent = s.get("agent", "claude")
+
+        # OpenCode：直接读 sqlite 的最近 assistant 文本
+        if agent == "opencode":
+            from agent_state import read_agent_state
+            st = read_agent_state(agent, 0, s.get("cwd", ""))
+            if st and st.text:
+                return st.text
+            return "(sent — opencode 输出暂不可读，用 /status 查看)"
+
         log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
 
         # Try log file (screen sessions created via /new)

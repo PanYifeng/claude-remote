@@ -37,39 +37,42 @@ except NameError:
 
 
 def find_claude_processes() -> list[dict]:
-    """查找所有运行中的 claude 进程
+    """查找所有运行中的 claude / opencode 进程
 
-    只匹配真正的 claude 二进制进程，不匹配包含 claude 关键词的 shell 命令。
+    匹配 claude 与 opencode 二进制进程，不匹配包含关键词的 shell 命令。
 
     Returns:
-        [{"pid": int, "tty": str, "cmd": str, "cwd": str}, ...]
+        [{"pid": int, "tty": str, "cmd": str, "cwd": str, "agent": str}, ...]
     """
+    # 支持的 agent 二进制名 → agent 类型
+    agent_binaries = {"claude", "opencode"}
     processes = []
     try:
-        # 方式一：通过 ps -e 列出所有进程，用 comm 匹配 claude 二进制
+        # 方式一：通过 ps -e 列出所有进程，用 comm 匹配 agent 二进制
         result = subprocess.run(
             ["ps", "-eo", "pid,tty,comm"],
             capture_output=True, text=True, timeout=5,
         )
-        claude_pids = set()
+        agent_pids: dict[int, str] = {}  # pid → agent 类型
         for line in result.stdout.splitlines():
             parts = line.strip().split(None, 2)
             if len(parts) < 3:
                 continue
             pid_str, tty, comm = parts
-            # 只匹配真正的 claude 二进制名
-            if comm != "claude":
+            # 只匹配真正的 agent 二进制名
+            if comm not in agent_binaries:
                 continue
             try:
-                claude_pids.add(int(pid_str))
+                agent_pids[int(pid_str)] = comm
             except ValueError:
                 continue
 
-        if not claude_pids:
+        if not agent_pids:
             return []
 
         # 方式二：获取这些进程的详细信息
-        for pid in sorted(claude_pids):
+        for pid in sorted(agent_pids):
+            agent = agent_pids[pid]
             # 获取完整命令行
             cmd_proc = subprocess.run(
                 ["ps", "-p", str(pid), "-o", "command="],
@@ -103,6 +106,7 @@ def find_claude_processes() -> list[dict]:
                 "tty": tty,
                 "cmd": cmd,
                 "cwd": cwd or os.getcwd(),
+                "agent": agent,
             })
     except Exception as e:
         print(f"扫描进程失败: {e}", file=sys.stderr)
@@ -167,11 +171,13 @@ def detect_process_type(proc: dict) -> tuple[str, str]:
 
 def get_name(proc: dict, kind: str, app_name: str) -> str:
     """生成可读的会话名称"""
+    agent = proc.get("agent", "claude")
+    agent_label = "OpenCode" if agent == "opencode" else "Claude"
     if app_name:
         return f"{app_name} — {os.path.basename(proc['cwd']) or '?'}"
     if proc["tty"]:
         return f"终端 {proc['tty']} — {os.path.basename(proc['cwd']) or '?'}"
-    return f"Claude (PID {proc['pid']})"
+    return f"{agent_label} (PID {proc['pid']})"
 
 
 def register_session(proc: dict, kind: str, app_name: str) -> str | None:
@@ -191,6 +197,7 @@ def register_session(proc: dict, kind: str, app_name: str) -> str | None:
         "pid": proc["pid"],
         "session_type": session_type,
         "app_name": app_name,
+        "agent": proc.get("agent", "claude"),
         "tags": {"registered_by": "scan-existing", "original_pid": proc["pid"], "tty": proc.get("tty", "")},
     }
 

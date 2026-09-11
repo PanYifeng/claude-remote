@@ -38,6 +38,7 @@
 - macOS (requires `tmux`, install via `brew install tmux`)
 - Python 3.11+
 - `lark-cli` (`brew install lark-cli`)
+- Claude Code (`claude`) and/or OpenCode (`opencode`, `brew install opencode`) — the agents you want to control
 - Lark app (create at [Lark Open Platform](https://open.feishu.cn))
 
 ### Install / 安装
@@ -65,28 +66,34 @@ python3 scan-existing --daemon
 
 ### Start a session / 启动会话
 
-There are two ways to launch a claude session that the daemon can control:
+Both **Claude Code** and **OpenCode** sessions are supported. There are two ways to launch a session the daemon can control:
 
-**Option A — `lcc` (recommended, full feature support)**
+**Option A — `lcc` / `loc` launcher (recommended, full feature support)**
 
-`lcc` wraps `claude`: it starts a detached tmux session (so output is captured to a log file) and registers it with the daemon automatically. Sessions launched this way get streaming output and accurate `/status` (same as `/new`), because a log file exists.
+`lcc` wraps `claude` and `loc` wraps `opencode`: each starts a detached tmux session and registers it with the daemon automatically.
+- `lcc` (claude) captures output to a log file → streaming output + accurate `/status`.
+- `loc` (opencode) reads status from OpenCode's SQLite DB (`~/.local/share/opencode/opencode.db`) → accurate `/status`; no log capture (TUI output is not log-friendly).
 
 ```bash
-# Install the wrapper somewhere on PATH
+# Install the wrappers somewhere on PATH
 sudo cp lcc /usr/local/bin/lcc && chmod +x /usr/local/bin/lcc
+sudo cp loc /usr/local/bin/loc && chmod +x /usr/local/bin/loc
 
-# From the project directory you want claude to work in:
-lcc                      # background tmux session (detach, control from Lark)
+# From the project directory you want the agent to work in:
+lcc                      # background claude in tmux (control from Lark)
+loc                      # background opencode in tmux (control from Lark)
 tmux attach -t claude-<id>   # optionally attach locally to watch
 
 lcc --name "论文搜索"     # name the session (shown in /l)
-lcc --foreground         # run in the current terminal instead of tmux
-lcc -- python train.py   # pass extra args to claude
+lcc --foreground         # run claude in the current terminal instead of tmux
+loc --foreground         # run opencode in the current terminal
 ```
+
+You can also start a session remotely from Lark: `/new <path>` (claude) or `/new-opencode <path>` (opencode) — both enter interactive mode.
 
 **Option B — `scan-existing` (adopt already-running sessions)**
 
-If you already have claude running in a terminal or IDE, `scan-existing` discovers and registers those processes (run above). These native terminal/IDE sessions support `/send`, `/confirm`, `/interrupt` (terminal sessions are targeted by TTY) but have no log file, so no streaming output — use `/status <id>` to read live output on demand.
+If you already have `claude` or `opencode` running in a terminal or IDE, `scan-existing` discovers and registers those processes (run above). These native terminal/IDE sessions support `/send`, `/confirm`, `/interrupt` (terminal sessions are targeted by TTY) but have no tmux log file, so no streaming output — use `/status <id>` to read live output on demand.
 
 ## Lark Bot Commands / 飞书机器人命令
 
@@ -150,11 +157,16 @@ ls -la      → sent to session
 
 ## Session Types / 会话类型
 
-| Icon | Type | Output Reading | Interactive Mode | Status Detection |
+Sessions are tagged by **agent** (Claude 🟦/💻 vs OpenCode 🟦) and **type** (how it runs):
+
+| Icon | Agent / Type | Output Reading | Interactive Mode | Status Detection |
 |:----:|------|:-------------:|:----------------:|:----------------:|
-| 💻 | Tmux (`/new`) | Log file ✅ | ✅ Full support (streaming) | ✅ Auto (log file) |
-| 💻 | Terminal (native) | N/A | ⚠️ Send only | ⚠️ Auto (running only) |
-| 🔌 | IDE (IntelliJ/PyCharm) | Live read (`/status`) | ⚠️ Send only | 🟢 Running (use `/status`) |
+| 💻 | Claude — Tmux (`/new`, `lcc`) | Log file ✅ | ✅ Full support (streaming) | ✅ Auto (log + state file) |
+| 💻 | Claude — Terminal/IDE (native) | Live read (`/status`) | ⚠️ Send only | ✅ Auto (state file) |
+| 🟦 | OpenCode — Tmux (`/new-opencode`, `loc`) | SQLite ✅ | ✅ (last assistant text) | ✅ Auto (SQLite) |
+| 🟦 | OpenCode — Terminal (native) | SQLite (`/status`) | ⚠️ Send only | ✅ Auto (SQLite) |
+
+> **OpenCode status** is read from `~/.local/share/opencode/opencode.db`: `idle` when the last step finished with `reason=stop`, `executing` otherwise (stale >120s → idle). Permission-prompt (`waiting`) auto-detection is best-effort — use `/status` to view live output.
 
 ## Status Detection / 状态检测
 
@@ -193,11 +205,14 @@ Each session in `/l` shows:
 ├── screen_manager.py   # Tmux session lifecycle management (replaces macOS broken screen)
 ├── registry.py         # SQLite session registry
 ├── ide_control.py      # IDE terminal control via AppleScript
+├── opencode_state.py   # Read OpenCode session state from SQLite
+├── agent_state.py      # Unified state reader (dispatches claude vs opencode)
 ├── dispatch.py         # Shared send/enter/ctrl-c router (used by lark_bot & daemon)
 ├── config.py           # Configuration from env vars
 ├── lcc                 # Launcher — start a tmux + daemon-registered claude session
+├── loc                 # Launcher — start a tmux + daemon-registered opencode session
 ├── ide-register        # Register an existing IDE/terminal claude session
-├── scan-existing       # Scan & register existing claude processes with heartbeat daemon
+├── scan-existing       # Scan & register existing claude/opencode processes with heartbeat daemon
 ├── LICENSE             # MIT License
 └── README.md           # This file
 ```
@@ -209,8 +224,9 @@ Each session in `/l` shows:
 | `CCR_DAEMON_PORT` | `9998` | Daemon HTTP port |
 | `CCR_DATA_DIR` | `~/.claude-remote` | Data storage directory |
 | `CCR_LOG_PATH` | `/tmp/claude-daemon.log` | Log file path |
-| `CCR_DAEMON_URL` | `http://localhost:9998` | Daemon URL (used by `lcc`) |
-| `CCR_SESSION_ID` | auto (UUID) | Force a session ID (used by `lcc`) |
+| `CCR_DAEMON_URL` | `http://localhost:9998` | Daemon URL (used by `lcc`/`loc`) |
+| `CCR_SESSION_ID` | auto (UUID) | Force a session ID (used by `lcc`/`loc`) |
+| `OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | OpenCode SQLite DB path (status reading) |
 | `LARK_APP_ID` | - | Lark App ID (required) |
 | `LARK_APP_SECRET` | - | Lark App Secret (required) |
 

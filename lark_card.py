@@ -206,6 +206,7 @@ def streaming_card(cmd: str, output: str, done: bool = False) -> str:
 
 def _session_label(s: dict) -> str:
     stype = s.get("session_type", "screen")
+    agent = s.get("agent", "claude")
     app = s.get("app_name", "")
     cwd = s.get("cwd", "")
     proj = cwd.split("/")[-1] if cwd else ""
@@ -213,11 +214,16 @@ def _session_label(s: dict) -> str:
     tty = ""
     if isinstance(tags, dict):
         tty = tags.get("tty", "")
-    icon = "🔌" if stype == "ide" else "💻"
+    # opencode 用 🟦 区分；claude 用 💻/🔌
+    if agent == "opencode":
+        icon = "🟦"
+    else:
+        icon = "🔌" if stype == "ide" else "💻"
     if stype == "ide" and app:
         base = f"{icon} {app} — {proj}" if proj else f"{icon} {app}"
     else:
-        base = f"{icon} Terminal — {proj}" if proj else f"{icon} Terminal"
+        kind = "OpenCode" if agent == "opencode" else "Terminal"
+        base = f"{icon} {kind} — {proj}" if proj else f"{icon} {kind}"
     if tty:
         base += f" ({tty})"
     return base
