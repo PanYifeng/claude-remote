@@ -125,6 +125,24 @@ class ScreenManager:
         logger.info("Killed session: %s", session_id)
         return True
 
+    async def read_pane(self, session_id: str, lines: int = 50) -> str:
+        """通过 tmux capture-pane 读取 pane 当前可见内容
+
+        用于没有日志文件的会话（如 OpenCode TUI：loc 不用 script 捕获日志，
+        审批提示直接渲染在 tmux pane 里）。capture-pane 读取 pane 缓冲区，
+        非侵入、不抢焦点。
+        """
+        session_name = self._session_name(session_id)
+        if not await self.is_alive(session_id):
+            return ""
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "capture-pane", "-p", "-t", session_name,
+            "-S", f"-{lines}", "-E", "-",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        return stdout.decode("utf-8", errors="replace")
+
     async def read_output(
         self, session_id: str, lines: int = 50
     ) -> tuple[str, int]:
@@ -330,9 +348,47 @@ class ScreenManager:
 
         return "running"
 
+    # Claude Code 等待输入的特征（审批/确认提示）
+    _CLAUDE_WAITING_PATTERNS = [
+        r"[？?]\s*\([Yy]/[Nn]\)",
+        r"\$?\s*[Yy]/[Nn]\s*$",
+        r"[Cc]ontinue",
+        r"[Pp]roceed\s*[？?]?\s*$",
+        r"requires approval",
+        r"[Aa]pprov",
+        r"[Ss]elect\s+",
+        r"[Cc]onfirm\s+",
+        r"Do you want to proceed\?",
+        r"Enter to confirm",
+        r"Esc to cancel",
+        r">>>\s*$",
+    ]
+
+    # OpenCode 等待输入的特征（permission.tsx / question.tsx 渲染的文本）
+    # 源码确认的字符串：审批按钮 "Allow once"/"Allow always"/"Reject"、
+    # 标题 "Permission required"/"Shell command"、问题工具 "Type your own answer"
+    _OPENCODE_WAITING_PATTERNS = [
+        r"Allow once",
+        r"Allow always",
+        r"\bReject\b",
+        r"Permission required",
+        r"Always allow",
+        r"This will allow.*until OpenCode is restarted",
+        r"Type your own answer",
+        r"select all that apply",
+        r"Tell OpenCode what to do differently",
+        r"Confirm permission rejection",
+        r"Continue after repeated failures",
+    ]
+
     @staticmethod
-    def _looks_waiting(output: str) -> bool:
-        """Check if output contains a waiting-for-input pattern"""
+    def _looks_waiting(output: str, *, agent: str = "claude") -> bool:
+        """判断输出是否包含等待输入提示
+
+        agent 区分两种 TUI 的审批/问题文本：claude（Claude Code）与
+        opencode（OpenCode permission.tsx / question.tsx）。两者模式不同，
+        需分别匹配。
+        """
         if not output:
             return False
 
@@ -340,24 +396,20 @@ class ScreenManager:
         if not lines:
             return False
 
-        waiting_patterns = [
-            r"[？?]\s*\([Yy]/[Nn]\)",
-            r"\$?\s*[Yy]/[Nn]\s*$",
-            r"[Cc]ontinue",
-            r"[Pp]roceed\s*[？?]?\s*$",
-            r"requires approval",
-            r"[Aa]pprov",
-            r"[Ss]elect\s+",
-            r"[Cc]onfirm\s+",
-            r"Do you want to proceed\?",
-            r"Enter to confirm",
-            r"Esc to cancel",
-            r">>>\s*$",
-        ]
+        # 按需选择模式集：opencode 只匹配 opencode 模式，claude 匹配 claude 模式
+        if agent == "opencode":
+            patterns = ScreenManager._OPENCODE_WAITING_PATTERNS
+            for line in lines:
+                stripped = line.strip()
+                for pat in patterns:
+                    if re.search(pat, stripped):
+                        return True
+            return False
 
+        patterns = ScreenManager._CLAUDE_WAITING_PATTERNS
         for line in lines:
             stripped = line.strip().rstrip()
-            for pat in waiting_patterns:
+            for pat in patterns:
                 if re.search(pat, stripped):
                     return True
 

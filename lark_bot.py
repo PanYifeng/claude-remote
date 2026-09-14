@@ -362,17 +362,11 @@ class LarkBot:
             if st.status:
                 status = st.status
             # 待确认补充：终端会话再按 TTY 抓一下，approval 提示未必反映在状态里
-            if stype == "terminal" and status != "waiting":
-                tags = s.get("tags", {}) or {}
-                tty = tags.get("tty", "") if isinstance(tags, dict) else ""
-                if tty:
-                    try:
-                        live_output, _ = self.ide_ctrl.read_terminal_by_tty(tty, 30)
-                        if live_output and ScreenManager._looks_waiting(live_output):
-                            status = "waiting"
-                            output = (ts_text + "\n\n—— 待确认 ——\n" + live_output[-400:]) if ts_text else live_output[-600:]
-                    except Exception:
-                        pass
+            if status != "waiting":
+                live_output = await self._read_session_visible(s, stype, agent)
+                if live_output and ScreenManager._looks_waiting(live_output, agent=agent):
+                    status = "waiting"
+                    output = (ts_text + "\n\n—— 待确认 ——\n" + live_output[-400:]) if ts_text else live_output[-600:]
             if output:
                 self.registry.update(session_id, status=status, last_output=output[-800:])
             else:
@@ -389,7 +383,7 @@ class LarkBot:
                 except Exception:
                     live_output = ""
                 if live_output and ScreenManager._looks_claude_terminal(live_output) \
-                        and ScreenManager._looks_waiting(live_output):
+                        and ScreenManager._looks_waiting(live_output, agent=agent):
                     status = "waiting"
                     if live_output:
                         output = (ts_text + "\n\n—— 待确认 ——\n" + live_output[-400:]) if ts_text else live_output[-600:]
@@ -415,7 +409,7 @@ class LarkBot:
                         if live_output:
                             read_via_tty = True
                             output = live_output
-                            if ScreenManager._looks_waiting(live_output):
+                            if ScreenManager._looks_waiting(live_output, agent=agent):
                                 status = "waiting"
                             elif any(x in live_output for x in ("❯", "plan mode", "Claude", "accept edits", "$ ", "# ")):
                                 status = "idle"
@@ -689,6 +683,33 @@ class LarkBot:
             pass
 
         return "(sent — view output in the terminal directly)"
+
+    async def _read_session_visible(
+        self, s: dict, stype: str, agent: str
+    ) -> str:
+        """读取会话终端可见文本，用于审批提示检测
+
+        terminal 会话按 TTY 抓 Terminal.app tab 内容（非侵入）；
+        screen 会话读 tmux pane（capture-pane，非侵入）——仅 opencode，
+        claude screen 有 log 文件走原逻辑；
+        ide 会话不抢焦点读屏，返回空串。
+        """
+        if stype == "terminal":
+            tags = s.get("tags", {}) or {}
+            tty = tags.get("tty", "") if isinstance(tags, dict) else ""
+            if not tty:
+                return ""
+            try:
+                live_output, _ = self.ide_ctrl.read_terminal_by_tty(tty, 30)
+                return live_output
+            except Exception:
+                return ""
+        if stype == "screen" and agent == "opencode":
+            try:
+                return await self.screen_mgr.read_pane(s["id"], 40)
+            except Exception:
+                return ""
+        return ""
 
     @staticmethod
     def _read_log_output(log_path: str) -> str:

@@ -360,12 +360,18 @@ class Daemon:
                     st = read_agent_state(agent, pid, s.get("cwd", ""))
                     status = st.status if (st and st.session_id) else None
                     if status:
+                        # OpenCode：权威状态（sqlite）只区分 idle/executing，
+                        # 审批提示在 TUI 渲染、未入库。按 TTY 抓终端可见内容补检测
+                        if agent == "opencode":
+                            status = await self._detect_opencode_waiting(
+                                session_id, s, status
+                            )
                         # 有 log 文件的会话再补一刀 approval 提示检测（claude status 未必标 waiting）
                         log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
                         if os.path.exists(log_path):
                             try:
                                 output, _ = await self.screen_mgr.read_output(session_id, 15)
-                                if output and ScreenManager._looks_waiting(output):
+                                if output and ScreenManager._looks_waiting(output, agent=agent):
                                     status = "waiting"
                                     self.registry.update(session_id, last_output=output[-500:])
                             except Exception:
@@ -374,7 +380,7 @@ class Daemon:
                         # 无状态文件但有 log：用 log 内容判定
                         output, _ = await self.screen_mgr.read_output(session_id, 15)
                         if output:
-                            if ScreenManager._looks_waiting(output):
+                            if ScreenManager._looks_waiting(output, agent=agent):
                                 status = "waiting"
                             else:
                                 lines = [l.strip().rstrip() for l in output.strip().splitlines() if l.strip()]
@@ -387,6 +393,11 @@ class Daemon:
                                 self.registry.update(session_id, last_output=output[-500:])
                         else:
                             status = "running"
+                    elif agent == "opencode":
+                        # 无 log 的 opencode 终端会话：按 TTY 抓终端可见内容补检测
+                        status = await self._detect_opencode_waiting(
+                            session_id, s, status or "running"
+                        )
                     else:
                         # 无状态文件无 log：无法判定
                         status = "running"
@@ -416,6 +427,8 @@ class Daemon:
             if agent == "opencode":
                 st = read_agent_state(agent, 0, s.get("cwd", ""))
                 status = st.status if (st and st.status) else s.get("status", "running")
+                # 审批提示在 TUI 渲染、未入库。从 tmux pane 抓可见内容补检测
+                status = await self._detect_opencode_waiting(session_id, s, status)
                 text = st.text if st else ""
                 if status != s.get("status"):
                     logger.info("Session %s status: %s -> %s", session_id[:8], s.get("status"), status)
@@ -427,6 +440,47 @@ class Daemon:
             output, _ = await self.screen_mgr.read_output(session_id, 10)
             status = await self.screen_mgr.detect_status(session_id, pid=s.get("pid"), last_update=s.get("updated_at"))
             self.registry.update(session_id, status=status, last_output=output[-300:] if len(output) > 300 else output)
+
+    async def _detect_opencode_waiting(
+        self, session_id: str, session: dict, fallback: str
+    ) -> str:
+        """OpenCode 审批提示检测，返回最终状态
+
+        OpenCode 的权限审批状态只渲染在 TUI、不入 sqlite，需读终端可见文本
+        匹配审批/问题文案。screen 会话走 tmux capture-pane（非侵入），
+        terminal 会话走 TTY（非侵入，不抢焦点）。命中审批则返回 "waiting"，
+        否则返回 fallback。IDE 会话不抢焦点读屏，直接返回 fallback。
+        """
+        if fallback == "waiting":
+            return fallback
+        stype = session.get("session_type", "screen")
+        if stype == "ide":
+            return fallback
+        try:
+            output = await self._read_opencode_visible(session_id, session, stype)
+        except Exception as e:
+            logger.warning("opencode waiting read failed: %s", e)
+            return fallback
+        if output and ScreenManager._looks_waiting(output, agent="opencode"):
+            logger.info("Session %s opencode waiting detected", session_id[:8])
+            self.registry.update(session_id, last_output=output[-500:])
+            return "waiting"
+        return fallback
+
+    async def _read_opencode_visible(
+        self, session_id: str, session: dict, stype: str
+    ) -> str:
+        """读取 OpenCode 会话的终端可见文本（screen→tmux, terminal→TTY）"""
+        if stype == "terminal":
+            tags = session.get("tags", {}) or {}
+            tty = tags.get("tty", "") if isinstance(tags, dict) else ""
+            if not tty:
+                return ""
+            text, _ = await asyncio.to_thread(
+                self.ide_ctrl.read_terminal_by_tty, tty, 30
+            )
+            return text
+        return await self.screen_mgr.read_pane(session_id, 40)
 
     # ── Event consume ────────────────────────────────
     async def _auto_discover_claude_processes(self, existing_sessions: list[dict]) -> None:

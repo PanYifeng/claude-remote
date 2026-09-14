@@ -163,10 +163,10 @@ Sessions are tagged by **agent** (Claude 🟦/💻 vs OpenCode 🟦) and **type*
 |:----:|------|:-------------:|:----------------:|:----------------:|
 | 💻 | Claude — Tmux (`/new`, `lcc`) | Log file ✅ | ✅ Full support (streaming) | ✅ Auto (log + state file) |
 | 💻 | Claude — Terminal/IDE (native) | Live read (`/status`) | ⚠️ Send only | ✅ Auto (state file) |
-| 🟦 | OpenCode — Tmux (`/new-opencode`, `loc`) | SQLite ✅ | ✅ (last assistant text) | ✅ Auto (SQLite) |
-| 🟦 | OpenCode — Terminal (native) | SQLite (`/status`) | ⚠️ Send only | ✅ Auto (SQLite) |
+| 🟦 | OpenCode — Tmux (`/new-opencode`, `loc`) | SQLite ✅ | ✅ (last assistant text) | ✅ Auto (SQLite + tmux pane) |
+| 🟦 | OpenCode — Terminal (native) | SQLite (`/status`) | ⚠️ Send only | ✅ Auto (SQLite + TTY) |
 
-> **OpenCode status** is read from `~/.local/share/opencode/opencode.db`: `idle` when the last step finished with `reason=stop`, `executing` otherwise (stale >120s → idle). Permission-prompt (`waiting`) auto-detection is best-effort — use `/status` to view live output.
+> **OpenCode status** is read from `~/.local/share/opencode/opencode.db`: `idle` when the last step finished with `reason=stop`, `executing` otherwise (stale >120s → idle). The SQLite state only distinguishes `idle`/`executing` — the permission-prompt (`waiting`) is rendered in the TUI and never persisted to the DB, so it is detected separately by scraping the terminal's visible text: **tmux `capture-pane`** for tmux sessions, **TTY read** for native terminal sessions (both non-invasive, no focus steal). IDE sessions skip the scrape (would steal focus) — use `/status` for those.
 
 ## Status Detection / 状态检测
 
@@ -184,7 +184,7 @@ Use `/status <id>` to read live terminal output and get the accurate status (wai
 Status detection uses multiple strategies:
 1. **Log file analysis:** Tmux sessions read log output every 5s; checks for waiting patterns, prompt suffix, or executing content
 2. **Live terminal read:** `/status <id>` reads IDE terminal content via AppleScript (Cmd+A → Cmd+C) to detect waiting/idle/executing
-3. **Waiting pattern matching:** Scans all lines for "Do you want to proceed?", "requires approval", "Esc to cancel", "Enter to confirm", etc.
+3. **Waiting pattern matching:** Scans all lines for approval/confirm prompts. Claude Code patterns include "Do you want to proceed?", "requires approval", "Esc to cancel", "Enter to confirm"; OpenCode patterns (from its `permission.tsx`/`question.tsx` TUI) include "Allow once", "Allow always", "Reject", "Permission required", "Type your own answer". Each agent matches only its own patterns to avoid false positives.
 
 ## Status Display / 卡片展示
 
