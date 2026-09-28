@@ -54,14 +54,14 @@ brew install tmux
 export LARK_APP_ID="cli_xxxxxxxxxxxxx"
 export LARK_APP_SECRET="xxxxxxxxxxxxxxxxxxxxx"
 
-# Start daemon
-python3 daemon.py
+# Install the launchd service (auto-start at login, auto-restart on crash)
+cp com.dp.claude-remote.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dp.claude-remote.plist
+```
 
-# Register all existing claude processes
-python3 scan-existing
+> **Run daemon as a launchd service (recommended).** The LaunchAgent (`com.dp.claude-remote.plist`) starts the daemon at login and relaunches it if it crashes or the Mac reboots. `run-daemon.sh` (invoked by launchd) extracts `LARK_APP_ID`/`LARK_APP_SECRET` from `~/.zshrc` (launchd does not inherit shell env), adds Homebrew to `PATH` (tmux/lark-cli), and writes logs to `~/.claude-remote/logs/` instead of `/tmp` (macOS purges `/tmp` files after 3 days). The old `restart.sh` (plain `nohup`) survives neither reboot nor crash — use it only for manual debugging.
 
-# Start heartbeat daemon (keeps sessions alive)
-python3 scan-existing --daemon
+Legacy manual start (debugging only): `python3 daemon.py`, then `python3 scan-existing` to register existing claude processes. A separate `scan-existing --daemon` heartbeat is not needed under launchd — the daemon's health-check loop auto-discovers new processes every cycle.
 ```
 
 ### Start a session / 启动会话
@@ -211,6 +211,8 @@ Each session in `/l` shows:
 ├── config.py           # Configuration from env vars
 ├── lcc                 # Launcher — start a tmux + daemon-registered claude session
 ├── loc                 # Launcher — start a tmux + daemon-registered opencode session
+├── run-daemon.sh       # launchd entrypoint — env/PATH setup + persistent logging
+├── com.dp.claude-remote.plist  # LaunchAgent template (auto-start + KeepAlive)
 ├── ide-register        # Register an existing IDE/terminal claude session
 ├── scan-existing       # Scan & register existing claude/opencode processes with heartbeat daemon
 ├── LICENSE             # MIT License
