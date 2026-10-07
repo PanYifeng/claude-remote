@@ -150,7 +150,8 @@ ls -la      → sent to session
 - Use number shortcuts: `/confirm 1`, `/status 2`, `/send 3 pwd`
 - `/confirm` or `/interrupt` without ID acts on last session
 - `/new <path>` creates a tmux session + log file for accurate output reading
-- `/send` pastes via the clipboard (supports Chinese and other non-ASCII text; keystroke alone cannot type multibyte characters)
+- `/send` to terminal sessions uses Terminal's `do script ... in tab` (headless: no focus, no clipboard, works with the screen locked; CJK text works natively). Multi-line text is submitted line by line
+- `/interrupt` on terminal sessions sends SIGINT to the tty's foreground process group — exactly equivalent to Ctrl+C, also works headless
 - ID supports fuzzy matching — first 8 chars are sufficient
 - `/exit --kill` updates the last interactive card with stop status
 - `/status <id>` reads live terminal output for IDE sessions — detects waiting/idle/executing

@@ -7,7 +7,13 @@
 - screen：经 tmux 发送
 
 lark_bot 与 daemon 共用此函数，避免路由逻辑重复。
+
+所有 ide_ctrl 调用（内部是同步 subprocess.run）都经 asyncio.to_thread 执行：
+失败时 osascript 最多阻塞 8s，若直接在事件循环里跑会卡死健康检查和
+Lark 事件消费。
 """
+
+import asyncio
 
 from ide_control import session_tty
 
@@ -38,11 +44,11 @@ async def send_to_session(ide_ctrl, screen_mgr, session: dict, action: str, text
         tty = session_tty(session)
         if tty:
             if action == "send":
-                return ide_ctrl.send_keys_to_tty(tty, text)
+                return await asyncio.to_thread(ide_ctrl.send_keys_to_tty, tty, text)
             if action == "enter":
-                return ide_ctrl.send_enter_to_tty(tty)
+                return await asyncio.to_thread(ide_ctrl.send_enter_to_tty, tty)
             if action == "ctrl_c":
-                return ide_ctrl.send_ctrl_c_to_tty(tty)
+                return await asyncio.to_thread(ide_ctrl.send_ctrl_c_to_tty, tty)
             return False
         app = session.get("app_name", "") or "Terminal"
     elif stype == "ide":
@@ -59,9 +65,9 @@ async def send_to_session(ide_ctrl, screen_mgr, session: dict, action: str, text
 
     # ide 或无 tty 的 terminal：发到 app
     if action == "send":
-        return ide_ctrl.send_keys(app, text)
+        return await asyncio.to_thread(ide_ctrl.send_keys, app, text)
     if action == "enter":
-        return ide_ctrl.send_enter(app)
+        return await asyncio.to_thread(ide_ctrl.send_enter, app)
     if action == "ctrl_c":
-        return ide_ctrl.send_ctrl_c(app)
+        return await asyncio.to_thread(ide_ctrl.send_ctrl_c, app)
     return False

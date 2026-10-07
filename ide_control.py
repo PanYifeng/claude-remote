@@ -8,14 +8,19 @@ Provides:
 - send_ctrl_c(): Send Ctrl+C
 - list_terminals(): List all controllable IDE terminals
 - read_output(): Read terminal output via Select All -> Copy -> Clipboard
+- send_keys_to_tty() / send_enter_to_tty(): Headless Terminal.app tab input
+  via `do script` (no focus, works with screen locked)
+- send_ctrl_c_to_tty(): SIGINT to the tty's foreground process group
 
 Requires: System Settings -> Privacy & Security -> Accessibility -> authorize python3
+(only needed for IDE app paths; the tty paths are headless)
 """
 
 import json
 import logging
 import os
 import re
+import signal
 import subprocess
 from typing import Optional
 
@@ -367,46 +372,46 @@ class IDEControl:
         except Exception:
             return False
 
-    def _send_to_terminal_tty(self, tty: str, keystroke_lines: str) -> bool:
-        """向 Terminal.app 中匹配 tty 的 tab 发送击键（单次 osascript）
+    def _do_script_to_tty(self, tty: str, commands: list[str]) -> bool:
+        """向 Terminal.app 中匹配 tty 的 tab 逐行执行 do script（无头发送）
 
-        复用 read_terminal_by_tty 的 tab 定位循环：找到匹配 tab 后选定该 tab、把
-        所在窗口提到最前、激活 Terminal.app，再执行击键——确保击键落到目标会话
-        而非任意最前面的 tab。找不到匹配 tab 时不发送任何击键（返回 False），避免
-        误发到其它会话。单次 osascript 是必须的：分次调用会在调用间丢焦点。
+        旧路径（activate + System Events keystroke）在锁屏时挂起——远程用
+        手机操控时 Mac 恰恰处于锁屏状态，/send 曾因此全部超时失败
+        （2026-10-01 事故）。do script 只走 Apple Events，锁屏也能送达；
+        文本直接写入 tty，多字节（中文）字符天然支持，且不再占用剪贴板。
 
         Args:
             tty: TTY 设备名（如 "ttys005"）
-            keystroke_lines: 击键 AppleScript 片段，在 'tell process "Terminal"'
-                块内执行，如 'keystroke "ls"' 'keystroke return'
+            commands: 逐行执行的命令列表（空串 = 单发一个回车）
 
         Returns:
             True 已发送；False tab 未找到或发送失败
         """
-        if not tty:
+        if not tty or not commands:
             return False
         tty_esc = tty.replace('"', '\\"')
+        # 每个 command 一条 do script：多行文本逐行提交（空串即回车）。
+        # 语句间必须换行——AppleScript 不允许两条语句挤在同一行
+        script_lines = "\n            ".join(
+            f'do script "{self._applescript_escape(cmd)}" in theTab'
+            for cmd in commands
+        )
         script = f"""
         set targetTTY to "{tty_esc}"
         set didFind to false
         tell application "Terminal"
-            set wCount to count of windows
-            repeat with wi from 1 to wCount
+            repeat with wi from 1 to count of windows
                 try
                     set w to window wi
-                    set tCount to count of tabs of w
-                    repeat with ti from 1 to tCount
+                    repeat with ti from 1 to count of tabs of w
                         set theTab to tab ti of w
                         set tabTTY to tty of theTab
                         if tabTTY starts with "/dev/" then
                             set tabTTY to text 6 thru -1 of tabTTY
                         end if
                         if tabTTY is targetTTY then
-                            set selected tab of w to theTab
                             set didFind to true
-                            try
-                                set index of w to 1
-                            end try
+                            {script_lines}
                             exit repeat
                         end if
                     end repeat
@@ -417,16 +422,6 @@ class IDEControl:
         if not didFind then
             return "CCR_TAB_NOT_FOUND"
         end if
-        delay 0.25
-        tell application "Terminal" to activate
-        delay 0.15
-        tell application "System Events"
-            tell process "Terminal"
-                set frontmost to true
-                delay 0.1
-                {keystroke_lines}
-            end tell
-        end tell
         return "CCR_OK"
         """
         try:
@@ -435,32 +430,72 @@ class IDEControl:
                 capture_output=True, text=True, timeout=8,
             )
         except Exception as e:
-            logger.warning("send_to_terminal_tty(%s) failed: %s", tty, e)
+            logger.warning("do_script_to_tty(%s) failed: %s", tty, e)
             return False
         if result.returncode != 0:
-            logger.warning("send_to_terminal_tty(%s) osascript error: %s", tty, result.stderr.strip())
+            logger.warning("do_script_to_tty(%s) osascript error: %s", tty, result.stderr.strip())
             return False
         if result.stdout.strip() == "CCR_TAB_NOT_FOUND":
-            logger.warning("send_to_terminal_tty(%s): tab not found", tty)
+            logger.warning("do_script_to_tty(%s): tab not found", tty)
             return False
         return True
 
-    def send_keys_to_tty(self, tty: str, text: str) -> bool:
-        """向 tty 对应的 Terminal tab 发送文本 + 回车
+    @staticmethod
+    def _applescript_escape(s: str) -> str:
+        """转义 AppleScript 字符串字面量（反斜杠 + 双引号）"""
+        return s.replace("\\", "\\\\").replace('"', '\\"')
 
-        走剪贴板 Cmd+V 粘贴：keystroke 无法输入中文等多字节字符，会打成乱码，
-        必须用剪贴板绕过。
+    def send_keys_to_tty(self, tty: str, text: str) -> bool:
+        """向 tty 对应的 Terminal tab 发送文本 + 回车（do script，无头）
+
+        多行文本逐行发送（每行独立提交），单行行为与键盘输入一致。
         """
-        paste = "delay 0.1\n            keystroke \"v\" using command down\n            keystroke return"
-        return self._with_clipboard_text(text, lambda: self._send_to_terminal_tty(tty, paste))
+        lines = text.split("\n") if text else [""]
+        return self._do_script_to_tty(tty, lines)
 
     def send_enter_to_tty(self, tty: str) -> bool:
-        """向 tty 对应的 Terminal tab 发送回车"""
-        return self._send_to_terminal_tty(tty, "keystroke return")
+        """向 tty 对应的 Terminal tab 发送回车（do script 空串）"""
+        return self._do_script_to_tty(tty, [""])
 
     def send_ctrl_c_to_tty(self, tty: str) -> bool:
-        """向 tty 对应的 Terminal tab 发送 Ctrl+C（中断，SIGINT）"""
-        return self._send_to_terminal_tty(tty, "key code 8 using control down")
+        """向 tty 的前台进程组发送 SIGINT（等价键盘 Ctrl+C，无头）
+
+        拿到该 tty 当前前台进程组后 kill(-pgrp, SIGINT)，与键盘 Ctrl+C
+        完全等价（TTY ISIG 语义：信号发给整个前台进程组），且不依赖
+        GUI/System Events，锁屏可用。前台进程组优先用 tcgetpgrp（精确、
+        无竞态），失败时退回 ps 的 tpgid 列（tcgetpgrp 在个别受限环境
+        下返回 ENOTTY）。
+        """
+        pgrp = self._tty_foreground_pgrp(tty)
+        if not pgrp:
+            return False
+        try:
+            os.kill(-pgrp, signal.SIGINT)
+            return True
+        except OSError as e:
+            logger.warning("kill(-%d, SIGINT) failed: %s", pgrp, e)
+            return False
+
+    @staticmethod
+    def _tty_foreground_pgrp(tty: str) -> int:
+        """查询 tty 的前台进程组 ID，失败返回 0"""
+        try:
+            fd = os.open(f"/dev/{tty}", os.O_RDONLY | os.O_NOCTTY)
+            try:
+                return os.tcgetpgrp(fd)
+            finally:
+                os.close(fd)
+        except OSError as e:
+            logger.warning("tcgetpgrp(%s) failed: %s, falling back to ps", tty, e)
+        try:
+            out = subprocess.run(
+                ["ps", "-t", tty, "-o", "tpgid="],
+                capture_output=True, text=True, timeout=3,
+            )
+            return int(out.stdout.strip().splitlines()[0])
+        except Exception as e:
+            logger.warning("ps tpgid(%s) failed: %s", tty, e)
+            return 0
 
     def read_terminal_output(self, lines: int = 50) -> tuple[str, int]:
         """Read macOS Terminal.app visible content via AppleScript

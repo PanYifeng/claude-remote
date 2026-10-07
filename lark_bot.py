@@ -754,7 +754,9 @@ class LarkBot:
             self.registry.update(session_id, status="running")
             _session_context.setdefault(chat_id, {})["selected"] = session_id
             return f"✅ Sent to {s.get('name', session_id[:8])}:\n```\n$ {text}\n```"
-        return "❌ Send failed, session may be stopped"
+        # 失败主因是 tab 已关闭（terminal）或 tmux 会话消失（screen），
+        # 无头 do script 路径不再依赖焦点，锁屏不会导致此失败
+        return f"❌ Send failed — session tab not found or unavailable. 用 `/status {session_id[:8]}` 检查"
 
     async def _cmd_confirm(self, args: list[str], chat_id: str) -> str:
         if args:
