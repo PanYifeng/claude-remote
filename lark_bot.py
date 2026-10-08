@@ -99,90 +99,148 @@ class LarkBot:
             logger.error("Failed to handle event line: %s", e, exc_info=True)
             return None
 
-    async def handle_card_action(self, data: dict) -> Optional[dict]:
-        """Handle a card.action.trigger event — user tapped a button"""
+    async def handle_card_event(self, event: dict) -> Optional[dict]:
+        """Handle a card.action.trigger event — user tapped a button on a card
+
+        lark-cli consume 输出结构未定（可能扁平、可能是 Lark v2 原始结构），
+        解析做成防御式，找不到 action 时打日志返回。
+        """
         try:
-            chat_id = data.get("chat_id", "")
-            message_id = data.get("message_id", "")
-            token = data.get("token", "")
-            action_value_raw = data.get("action_value", "{}")
+            info = self._parse_card_event(event)
+            action, sid = info["action"], info["session_id"]
+            chat_id, message_id = info["chat_id"], info["message_id"]
+            logger.info("Card action: %s session=%s chat=%s",
+                        action, sid[:8] if sid else "-", chat_id or "-")
+            if not action or not chat_id:
+                logger.warning("Card event missing action/chat: keys=%s", list(event.keys()))
+                return None
 
-            try:
-                action_value = json.loads(action_value_raw) if isinstance(action_value_raw, str) else action_value_raw
-            except json.JSONDecodeError:
-                action_value = {}
-
-            action = action_value.get("a", "")
-            session_id = action_value.get("s", "")
-
-            logger.info("Card action: %s session=%s", action, session_id[:8] if session_id else "-")
-
-            response_card = None
-
-            if action == "list":
-                sessions = self._update_list_cache(chat_id)
-                response_card = session_list_card(sessions)
-
-            elif action == "status":
-                s = self.registry.get(session_id) if session_id else None
-                if s:
-                    output, _ = await self._read_session_output(s)
-                    idx = self._find_index(session_id, chat_id)
-                    response_card = session_status_card(s, output, idx)
-                else:
-                    response_card = done_card("❌ Session not found.")
-
-            elif action == "confirm":
-                s = self.registry.get(session_id) if session_id else None
-                if s:
-                    await self._confirm_from_bot(s)
-                    sessions = self._update_list_cache(chat_id)
-                    response_card = session_list_card(sessions)
-                else:
-                    response_card = done_card("❌ Session not found.")
-
-            elif action == "interrupt":
-                s = self.registry.get(session_id) if session_id else None
-                if s:
-                    await self._interrupt_from_bot(s)
-                    sessions = self._update_list_cache(chat_id)
-                    response_card = session_list_card(sessions)
-                else:
-                    response_card = done_card("❌ Session not found.")
-
-            elif action == "stop":
-                s = self.registry.get(session_id) if session_id else None
-                if s:
-                    await self._stop_from_bot(s)
-                    sessions = self._update_list_cache(chat_id)
-                    response_card = session_list_card(sessions)
-                else:
-                    response_card = done_card("❌ Session not found.")
-
-            elif action == "pending":
-                waiting = self.registry.list(status_filter="waiting")
-                response_card = pending_card(waiting)
-
-            elif action == "confirm-all":
-                waiting = self.registry.list(status_filter="waiting")
-                success = failed = 0
-                for s in waiting:
-                    ok = await self._confirm_from_bot(s)
-                    if ok: success += 1
-                    else: failed += 1
-                response_card = confirm_all_card(success, failed)
-
-            elif action == "refresh":
-                sessions = self._update_list_cache(chat_id)
-                response_card = session_list_card(sessions)
-
-            if response_card:
-                self._update_card(token, response_card)
-
+            text, card = await self._run_card_action(action, sid, chat_id)
+            if card:
+                # 优先原位更新被点击的卡片；失败（或拿不到 message_id）则发新卡
+                if not (message_id and self._update_card_message(message_id, card)):
+                    self._send_card_to_chat(chat_id, card)
+            elif text:
+                await self._send_message(chat_id, text)
             return {"code": 0}
         except Exception as e:
-            logger.error("Failed to handle card action: %s", e, exc_info=True)
+            logger.error("Failed to handle card event: %s", e, exc_info=True)
             return None
+
+    async def _run_card_action(self, action: str, sid: str, chat_id: str) -> tuple[str, str]:
+        """执行卡片动作，返回 (text, card_json)，二者最多一个非空"""
+        if action in ("list", "refresh"):
+            sessions = self._update_list_cache(chat_id)
+            return "", session_list_card(sessions)
+
+        if action == "status":
+            s = self.registry.get(sid) if sid else None
+            if not s:
+                return "❌ Session not found.", ""
+            output, _ = await self._read_session_output(s)
+            return "", session_status_card(s, output)
+
+        if action in ("confirm", "interrupt", "stop"):
+            s = self.registry.get(sid) if sid else None
+            if not s:
+                return "❌ Session not found.", ""
+            ok = await {"confirm": self._confirm_from_bot,
+                        "interrupt": self._interrupt_from_bot,
+                        "stop": self._stop_from_bot}[action](s)
+            verb = {"confirm": "Confirmed", "interrupt": "Interrupted", "stop": "Stopped"}[action]
+            icon = "⏹️" if action == "stop" else ("✅" if ok else "❌")
+            return f"{icon} {verb} `{sid[:8]}`" if ok else f"❌ {action} failed", ""
+
+        if action == "pending":
+            waiting = self.registry.list(status_filter="waiting")
+            return "", pending_card(waiting)
+
+        if action == "confirm-all":
+            waiting = self.registry.list(status_filter="waiting")
+            success = failed = 0
+            for s in waiting:
+                if await self._confirm_from_bot(s):
+                    success += 1
+                else:
+                    failed += 1
+            return "", confirm_all_card(success, failed)
+
+        if action == "compose":
+            return await self._enter_compose_mode(sid, chat_id)
+
+        if action == "enter":
+            if not sid:
+                return "❌ Session not found.", ""
+            # _cmd_enter 自己发交互卡片，这里只透传其文本提示
+            return (await self._cmd_enter([sid], chat_id)) or "", ""
+
+        return f"Unknown card action: {action}", ""
+
+    async def _enter_compose_mode(self, sid: str, chat_id: str) -> tuple[str, str]:
+        """进入一次性发送模式：下一条非命令消息直接发到该会话"""
+        s = self.registry.get(sid) if sid else None
+        if not s:
+            return "❌ Session not found.", ""
+        _session_context.setdefault(chat_id, {})["compose"] = sid
+        _session_context[chat_id]["selected"] = sid
+        label = s.get("name") or sid[:8]
+        card = done_card(
+            f"📤 **Compose mode / 发送模式**\n\n"
+            f"**To / 发送到:** {label}\n\n"
+            f"直接回复消息内容即可发送（一条一次）。\n"
+            f"发送 `/cancel` 退出。"
+        )
+        return "", card
+
+    @staticmethod
+    def _parse_card_event(event: dict) -> dict:
+        """防御式解析 card.action.trigger 事件（lark-cli 输出结构未定）
+
+        返回 {"action", "session_id", "chat_id", "message_id"}
+        """
+        action, sid = LarkBot._first_action_value(event)
+        chat_id, message_id = LarkBot._ids_from_card_event(event)
+        return {"action": action, "session_id": sid,
+                "chat_id": chat_id, "message_id": message_id}
+
+    @staticmethod
+    def _first_action_value(event: dict) -> tuple[str, str]:
+        """在事件的各层结构里找按钮 value（{"a": 动作, "s": 会话 ID}）"""
+        sources = [event]
+        nested = event.get("event")
+        if isinstance(nested, dict):
+            sources.append(nested)
+        for src in sources:
+            candidates = [src.get("action_value"), src.get("value")]
+            act = src.get("action")
+            if isinstance(act, dict):
+                candidates.append(act.get("value"))
+            for c in candidates:
+                if isinstance(c, str):
+                    try:
+                        c = json.loads(c)
+                    except json.JSONDecodeError:
+                        continue
+                if isinstance(c, dict) and c.get("a"):
+                    return str(c["a"]), str(c.get("s", ""))
+        return "", ""
+
+    @staticmethod
+    def _ids_from_card_event(event: dict) -> tuple[str, str]:
+        """在事件的各层结构里找 chat_id / message_id（含 v2 的 contexts）"""
+        sources = [event]
+        nested = event.get("event")
+        if isinstance(nested, dict):
+            sources.append(nested)
+        chat_id = message_id = ""
+        for src in sources:
+            chat_id = chat_id or src.get("chat_id", "") or src.get("open_chat_id", "")
+            message_id = message_id or src.get("message_id", "") or src.get("open_message_id", "")
+            ctx = src.get("contexts")
+            if isinstance(ctx, dict):
+                chat_id = chat_id or ctx.get("open_chat_id", "")
+                message_id = message_id or ctx.get("open_message_id", "")
+        return chat_id, message_id
 
     async def handle_webhook(self, body: dict) -> Optional[dict]:
         """Handle Lark event callback (webhook compatibility)"""
@@ -291,9 +349,28 @@ class LarkBot:
             self._update_card_message(message_id, streaming_card(text, output, done=True))
             return ""  # Card sent, no text reply
 
+        # Compose 模式（卡片按钮 "发送…" 进入）：下一条非命令消息直接发到指定会话
+        compose_sid = ctx.get("compose")
+        if compose_sid and not text.startswith("/"):
+            ctx["compose"] = None  # 一次性：无论成败都退出
+            s = self.registry.get(compose_sid)
+            if not s:
+                return "❌ Session no longer exists. Exited compose mode."
+            ok = await self._dispatch_send(s, "send", text)
+            if not ok:
+                return f"❌ Send failed — session tab not found or unavailable. 用 `/status {compose_sid[:8]}` 检查"
+            self.registry.update(compose_sid, status="running")
+            ctx["selected"] = compose_sid
+            label = s.get("name") or compose_sid[:8]
+            return f"✅ Sent to {label}:\n```\n$ {text}\n```"
+
         # Normal command processing
         if not text.startswith("/"):
             return None
+        # /cancel 只在 compose 模式下有意义
+        if compose_sid and text.strip() == "/cancel":
+            ctx["compose"] = None
+            return "📤 Compose mode cancelled."
         parts = shlex.split(text[1:])
         if not parts:
             return COMMAND_HELP
@@ -1124,25 +1201,6 @@ class LarkBot:
             return True
         except Exception as e:
             logger.error("Reply card error: %s", e)
-            return False
-
-    def _update_card(self, token: str, card_json: str) -> bool:
-        """Update an existing interactive card in-place"""
-        if not token:
-            return False
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["lark-cli", "api", "POST", "/open-apis/interactive/v1/card/update",
-                 "--data", json.dumps({"token": token, "card": json.loads(card_json)}, ensure_ascii=False)],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode != 0:
-                logger.warning("Card update failed: %s", result.stderr[:200])
-                return False
-            return True
-        except Exception as e:
-            logger.error("Card update error: %s", e)
             return False
 
     def _resolve_id(self, short_id: str) -> Optional[str]:

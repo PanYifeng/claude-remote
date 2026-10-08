@@ -60,6 +60,7 @@ class Daemon:
         self._running = True
         self._health_task: Optional[asyncio.Task] = None
         self._event_task: Optional[asyncio.Task] = None
+        self._card_event_task: Optional[asyncio.Task] = None
         self._session_write_locks: dict[str, asyncio.Lock] = {}
 
     def _setup_routes(self) -> None:
@@ -281,6 +282,8 @@ class Daemon:
             self._health_task.cancel()
         if self._event_task:
             self._event_task.cancel()
+        if self._card_event_task:
+            self._card_event_task.cancel()
 
     async def _restart(self):
         """Shutdown then restart daemon"""
@@ -685,25 +688,28 @@ class Daemon:
                 new_tags["tty"] = tty
                 self.registry.update(s["id"], tags=json.dumps(new_tags, ensure_ascii=False))
 
-    async def event_consume_loop(self):
-        """Consume im.message.receive_v1 events via lark-cli
+    async def event_consume_loop(self, event_key: str = "im.message.receive_v1", handler=None):
+        """Consume Lark events via lark-cli (消息 + 卡片按钮共用)
 
         Must keep stdin PIPE open explicitly — lark-cli exits on stdin EOF.
+        handler 缺省时走 lark_bot.handle_event_line（消息事件）。
         """
-        logger.info("Starting Lark event consume")
+        if handler is None:
+            handler = self.lark_bot.handle_event_line
+        logger.info("Starting Lark event consume: %s", event_key)
 
         while self._running:
             proc = None
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "lark-cli", "event", "consume",
-                    "im.message.receive_v1", "--as", "bot", "--timeout", "0",
+                    event_key, "--as", "bot", "--timeout", "0",
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,  # 新进程组 → killpg 杀整棵树（node+lark-cli+_bus），防孤儿泄露
                 )
-                logger.info("Event consume started (PID: %d)", proc.pid)
+                logger.info("Event consume started (%s, PID: %d)", event_key, proc.pid)
                 stdin_keepalive = proc.stdin  # 防 GC 关 pipe（lark-cli 遇 stdin EOF 退出）
 
                 assert proc.stdout is not None
@@ -720,21 +726,21 @@ class Daemon:
                     if raw.startswith("{"):
                         try:
                             event_data = json.loads(raw)
-                            logger.info("Event received: keys=%s", list(event_data.keys())[:5])
-                            await self.lark_bot.handle_event_line(event_data)
+                            logger.info("Event received (%s): keys=%s", event_key, list(event_data.keys())[:5])
+                            await handler(event_data)
                         except json.JSONDecodeError:
                             pass
                         except Exception as e:
-                            logger.error("Event handler error: %s", e)
+                            logger.error("Event handler error (%s): %s", event_key, e)
 
                 await proc.wait()
-                logger.warning("Event consume exited (code: %d), restarting in 5s...", proc.returncode)
+                logger.warning("Event consume exited (%s, code: %d), restarting in 5s...", event_key, proc.returncode)
                 del stdin_keepalive
             except asyncio.CancelledError:
                 await self._kill_proc_tree(proc)  # task 取消（shutdown/restart）——杀整棵树防孤儿
                 raise
             except Exception as e:
-                logger.error("Event consume error: %s", e)
+                logger.error("Event consume error (%s): %s", event_key, e)
                 await self._kill_proc_tree(proc)
             await asyncio.sleep(5)
 
@@ -790,6 +796,11 @@ class Daemon:
         await site.start()
 
         self._event_task = asyncio.create_task(self.event_consume_loop(), name="lark-msg")
+        # 卡片按钮点击事件（card.action.trigger）——独立 consumer，与消息事件并行
+        self._card_event_task = asyncio.create_task(
+            self.event_consume_loop("card.action.trigger", self.lark_bot.handle_card_event),
+            name="lark-card",
+        )
 
         logger.info("Daemon started on http://127.0.0.1:%d", config.daemon_port)
 
@@ -800,6 +811,7 @@ class Daemon:
             self._running = False
             if self._health_task: self._health_task.cancel()
             if self._event_task: self._event_task.cancel()
+            if self._card_event_task: self._card_event_task.cancel()
 
     @staticmethod
     def _json(data, status=200):

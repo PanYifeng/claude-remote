@@ -387,15 +387,22 @@ class IDEControl:
         Returns:
             True 已发送；False tab 未找到或发送失败
         """
-        if not tty or not commands:
-            return False
-        tty_esc = tty.replace('"', '\\"')
-        # 每个 command 一条 do script：多行文本逐行提交（空串即回车）。
-        # 语句间必须换行——AppleScript 不允许两条语句挤在同一行
-        script_lines = "\n            ".join(
+        statements = [
             f'do script "{self._applescript_escape(cmd)}" in theTab'
             for cmd in commands
-        )
+        ]
+        return self._run_in_tty_tab(tty, statements)
+
+    def _run_in_tty_tab(self, tty: str, statements: list[str]) -> bool:
+        """在匹配 tty 的 Terminal tab 里依次执行 AppleScript 语句（无头）
+
+        statements 是完整的 AppleScript 语句（如 'do script "..." in theTab'），
+        语句间必须换行——AppleScript 不允许两条语句挤在同一行。
+        """
+        if not tty or not statements:
+            return False
+        tty_esc = tty.replace('"', '\\"')
+        script_lines = "\n            ".join(statements)
         script = f"""
         set targetTTY to "{tty_esc}"
         set didFind to false
@@ -430,13 +437,13 @@ class IDEControl:
                 capture_output=True, text=True, timeout=8,
             )
         except Exception as e:
-            logger.warning("do_script_to_tty(%s) failed: %s", tty, e)
+            logger.warning("run_in_tty_tab(%s) failed: %s", tty, e)
             return False
         if result.returncode != 0:
-            logger.warning("do_script_to_tty(%s) osascript error: %s", tty, result.stderr.strip())
+            logger.warning("run_in_tty_tab(%s) osascript error: %s", tty, result.stderr.strip())
             return False
         if result.stdout.strip() == "CCR_TAB_NOT_FOUND":
-            logger.warning("do_script_to_tty(%s): tab not found", tty)
+            logger.warning("run_in_tty_tab(%s): tab not found", tty)
             return False
         return True
 
@@ -446,12 +453,48 @@ class IDEControl:
         return s.replace("\\", "\\\\").replace('"', '\\"')
 
     def send_keys_to_tty(self, tty: str, text: str) -> bool:
-        """向 tty 对应的 Terminal tab 发送文本 + 回车（do script，无头）
+        """向 tty 对应的 Terminal tab 发送文本并提交（do script，无头）
 
-        多行文本逐行发送（每行独立提交），单行行为与键盘输入一致。
+        单行：文本 + 回车一次写入（do script 自带 Return），与键盘输入一致。
+        多行：bracketed paste 整体粘贴后再补一个回车提交 —— 逐行连发
+        do script 会被合并成带内嵌 \r 的单块，触发 TUI 的粘贴检测，
+        内容滞留输入框不提交（2026-10-08 /send 多行失效根因）。
         """
-        lines = text.split("\n") if text else [""]
-        return self._do_script_to_tty(tty, lines)
+        if not text:
+            return self.send_enter_to_tty(tty)
+        if "\n" not in text:
+            return self._do_script_to_tty(tty, [text])
+        return self._paste_multiline_to_tty(tty, text)
+
+    def _paste_multiline_to_tty(self, tty: str, text: str) -> bool:
+        """多行文本：ESC[200~ ... ESC[201~ 包裹整体粘贴 + 延迟补回车提交
+
+        bracketed paste 让 TUI 把多行内容作为一个整体放进输入框（不逐行
+        触发提交）；粘贴结束后单独补一个回车完成提交。粘贴语句自带的
+        尾随 Return 已在 ESC[201~ 之后，可作为第一次提交；延迟 0.15s 的
+        空串 do script 是保险（TUI 空输入时回车无副作用）。
+        """
+        paste_expr = " & ".join(self._bracketed_paste_parts(text))
+        statements = [
+            f"do script {paste_expr} in theTab",
+            "delay 0.15",
+            'do script "" in theTab',
+        ]
+        return self._run_in_tty_tab(tty, statements)
+
+    def _bracketed_paste_parts(self, text: str) -> list[str]:
+        """构造 bracketed paste 的 AppleScript 拼接片段列表
+
+        ESC 不可直接出现在字符串字面量里，用 (character id 27) 生成；
+        行间换行用 (character id 10)（LF），与真实粘贴流一致。
+        """
+        parts = ['(character id 27) & "[200~"']
+        for i, line in enumerate(text.split("\n")):
+            if i > 0:
+                parts.append("(character id 10)")
+            parts.append(f'"{self._applescript_escape(line)}"')
+        parts.append('(character id 27) & "[201~"')
+        return parts
 
     def send_enter_to_tty(self, tty: str) -> bool:
         """向 tty 对应的 Terminal tab 发送回车（do script 空串）"""

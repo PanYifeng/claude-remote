@@ -29,7 +29,10 @@ def session_list_card(sessions: list[dict]) -> str:
             sid = s["id"][:8]
             label = _session_label(s)
             rows.append(_md(f"🟡 **{sid}** {label}"))
-            rows.append(_cmd(f"/confirm {sid}"))
+            rows.append(_btn_row([
+                _btn("✅ 确认", "confirm", s["id"], "primary"),
+                _btn("📊 详情", "status", s["id"]),
+            ]))
         rows.append({"tag": "hr"})
 
     if executing:
@@ -38,7 +41,7 @@ def session_list_card(sessions: list[dict]) -> str:
             sid = s["id"][:8]
             label = _session_label(s)
             rows.append(_md(f"🔵 **{sid}** {label}"))
-            rows.append(_cmd(f"/status {sid}"))
+            rows.append(_btn_row([_btn("📊 详情", "status", s["id"])]))
 
     if idle:
         rows.append(_md(f"⏸️ **Idle / 空闲 ({len(idle)})**"))
@@ -46,7 +49,7 @@ def session_list_card(sessions: list[dict]) -> str:
             sid = s["id"][:8]
             label = _session_label(s)
             rows.append(_md(f"⏸️ **{sid}** {label}"))
-            rows.append(_cmd(f"/status {sid}"))
+            rows.append(_btn_row([_btn("📊 详情", "status", s["id"])]))
 
     if active_others:
         rows.append(_md(f"🟢 **Active / 活动 ({len(active_others)})**"))
@@ -54,7 +57,7 @@ def session_list_card(sessions: list[dict]) -> str:
             sid = s["id"][:8]
             label = _session_label(s)
             rows.append(_md(f"🟢 **{sid}** {label}"))
-            rows.append(_cmd(f"/status {sid}"))
+            rows.append(_btn_row([_btn("📊 详情", "status", s["id"])]))
 
     # 提示：IDE 类型 session 需要 /status 查看精确状态
     ide_count = sum(1 for s in active if s.get("session_type") == "ide")
@@ -63,8 +66,11 @@ def session_list_card(sessions: list[dict]) -> str:
         rows.append(_md("💡 IDE 会话（🔌）需要用 `/status <id>` 查看精确状态。"))
 
     rows.append({"tag": "hr"})
-    rows.append(_md("⬇️ Select & copy a command below / 长按选择复制命令"))
-    rows.append(_cmd("/confirm-all"))
+    rows.append(_btn_row([
+        _btn("🔄 刷新", "list", "", "primary"),
+        _btn("🟡 待确认", "pending", ""),
+        _btn("✅ 确认全部", "confirm-all", ""),
+    ]))
 
     title = f"🤖 {len(active)} sessions"
     parts = []
@@ -105,22 +111,20 @@ def session_status_card(s: dict, output: str = "", idx: int = -1) -> str:
             elements.append(_md(f"**Output / 输出:**\n```\n{display}\n```"))
 
     elements.append({"tag": "hr"})
-    elements.append(_md("⬇️ Select & copy / 长按选择复制"))
-
-    elements.append(_md("✅ Confirm / 确认（继续执行）"))
-    elements.append(_cmd(f"/confirm {sid}"))
-
-    elements.append(_md("✋ Interrupt / 中断（Ctrl+C，停止当前命令，会话保留）"))
-    elements.append(_cmd(f"/interrupt {sid}"))
-
-    elements.append(_md("⏹️ Stop / 终止（关闭整个会话，不可恢复）"))
-    elements.append(_cmd(f"/stop {sid}"))
-
-    elements.append(_md("📤 Send / 发送命令（末尾补上具体命令）"))
+    # 快捷操作按钮：点击直接执行，无需手动复制命令（value 用完整会话 ID）
+    elements.append(_btn_row([
+        _btn("✅ 确认", "confirm", s["id"], "primary"),
+        _btn("✋ 中断", "interrupt", s["id"]),
+        _btn("⏹️ 停止", "stop", s["id"]),
+    ]))
+    elements.append(_btn_row([
+        _btn("📤 发送…", "compose", s["id"]),
+        _btn("💬 交互", "enter", s["id"]),
+        _btn("🔄 刷新", "status", s["id"]),
+    ]))
+    # 保留一条可复制的 /send 命令行（compose 模式之外的手动用法）
     elements.append(_cmd(f"/send {sid} "))
 
-    elements.append(_md("💬 Interactive / 交互模式（直接对话）"))
-    elements.append(_cmd(f"/enter {sid}"))
 
     card = {
         "config": {"wide_screen_mode": False},
@@ -137,10 +141,12 @@ def pending_card(sessions: list[dict]) -> str:
     for i, s in enumerate(sessions, 1):
         label = _session_label(s)
         rows.append(_md(f"🟡 **{label}**"))
-        rows.append(_cmd(f"/confirm {i}"))
+        rows.append(_btn_row([
+            _btn("✅ 确认", "confirm", s["id"], "primary"),
+            _btn("📊 详情", "status", s["id"]),
+        ]))
     rows.append({"tag": "hr"})
-    rows.append(_md("⬇️ Confirm all / 一键确认全部"))
-    rows.append(_cmd("/confirm-all"))
+    rows.append(_btn_row([_btn("✅ 一键确认全部", "confirm-all", "", "primary")]))
     card = {
         "config": {"wide_screen_mode": False},
         "header": {"title": {"tag": "lark_md", "content": f"🟡 {len(sessions)} waiting / 待确认"}},
@@ -172,6 +178,27 @@ def _md(content: str) -> dict:
 def _cmd(cmd: str) -> dict:
     """Command displayed on its own line for easy selection & copy on mobile"""
     return {"tag": "div", "text": {"tag": "lark_md", "content": cmd}}
+
+
+def _btn(label: str, action: str, session_id: str = "", btn_type: str = "default") -> dict:
+    """交互卡片按钮：点击经 card.action.trigger 事件回调到 bot
+
+    value 里的 a=动作名、s=会话 ID，与 lark_bot.handle_card_event 约定一致。
+    """
+    value: dict = {"a": action}
+    if session_id:
+        value["s"] = session_id
+    return {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": label},
+        "type": btn_type,
+        "value": value,
+    }
+
+
+def _btn_row(buttons: list[dict]) -> dict:
+    """一行按钮（Lark action 元素，单行最多放 3 个较稳）"""
+    return {"tag": "action", "actions": buttons}
 
 
 def interactive_card(cmd: str, output: str) -> str:

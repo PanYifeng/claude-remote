@@ -147,14 +147,20 @@ ls -la      → sent to session
 
 ### Tips / 提示
 
+- Cards are interactive: tap buttons instead of typing commands —
+  - Session list card (`/l`): **✅ 确认** (confirm waiting), **📊 详情** (status), bottom row **🔄 刷新 / 🟡 待确认 / ✅ 确认全部**
+  - Status card (`/status`): **✅ 确认 / ✋ 中断 / ⏹️ 停止 / 📤 发送… / 💬 交互 / 🔄 刷新**
+  - **📤 发送…** enters compose mode: the next message you type is sent to that session directly (one-shot; `/cancel` to abort)
 - Use number shortcuts: `/confirm 1`, `/status 2`, `/send 3 pwd`
 - `/confirm` or `/interrupt` without ID acts on last session
 - `/new <path>` creates a tmux session + log file for accurate output reading
-- `/send` to terminal sessions uses Terminal's `do script ... in tab` (headless: no focus, no clipboard, works with the screen locked; CJK text works natively). Multi-line text is submitted line by line
+- `/send` to terminal sessions uses Terminal's `do script ... in tab` (headless: no focus, no clipboard, works with the screen locked; CJK text works natively). Single-line text submits directly; multi-line text is sent as a bracketed paste (ESC[200~ ... ESC[201~) followed by an Enter, so the TUI receives it as one message and submits it — line-by-line injection would coalesce into a paste-detected chunk that never submits
 - `/interrupt` on terminal sessions sends SIGINT to the tty's foreground process group — exactly equivalent to Ctrl+C, also works headless
 - ID supports fuzzy matching — first 8 chars are sufficient
 - `/exit --kill` updates the last interactive card with stop status
 - `/status <id>` reads live terminal output for IDE sessions — detects waiting/idle/executing
+
+Card button clicks require the Lark app to subscribe the `card.action.trigger` event (same event-consume mechanism as messages — no webhook needed).
 
 ## Session Types / 会话类型
 
@@ -237,8 +243,8 @@ Each session in `/l` shows:
 
 1. Open [Lark Open Platform](https://open.feishu.cn) → Create App
 2. Enable **Bot** capability
-3. Add permissions: `im:message.p2p_msg:readonly`
-4. Add event: `im.message.receive_v1` (callback URL not needed, uses event consume)
+3. Add permissions: `im:message.p2p_msg:readonly` (plus message-send permission for the bot to reply)
+4. Add events: `im.message.receive_v1` (messages) and `card.action.trigger` (card button clicks) — callback URL not needed, both use event consume
 5. Publish a new version
 6. Set `LARK_APP_ID` and `LARK_APP_SECRET` as environment variables
 
