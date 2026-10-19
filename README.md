@@ -95,6 +95,12 @@ You can also start a session remotely from Lark: `/new <path>` (claude) or `/new
 
 If you already have `claude` or `opencode` running in a terminal or IDE, `scan-existing` discovers and registers those processes (run above). These native terminal/IDE sessions support `/send`, `/confirm`, `/interrupt` (terminal sessions are targeted by TTY) but have no tmux log file, so no streaming output — use `/status <id>` to read live output on demand.
 
+> **⚠️ IDE sessions (🔌) and the lock screen.** IDE-embedded terminals (IntelliJ/PyCharm) hold their own ptys — on macOS there is no headless injection path to them (`do script` only reaches Terminal.app tabs; the `TIOCSTI` ioctl is rejected for non-root). Sends to IDE sessions use focus-based paste (`activate` + System Events), which:
+> - **fails silently when the screen is locked** — the daemon now detects the lock (frontmost process = `loginwindow`) and returns an immediate ❌ instead of a false ✅
+> - can paste into the wrong IDE panel if the embedded terminal isn't focused — click into the terminal once before sending
+>
+> For sessions you need to control **while the screen is locked**, start them with `lcc`/`loc` (tmux backend — `tmux send-keys`, no GUI involvement at all, works locked) — you can even run `lcc` inside an IDE terminal and keep watching it there.
+
 ## Lark Bot Commands / 飞书机器人命令
 
 ### Session Management / 会话管理

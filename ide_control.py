@@ -262,6 +262,11 @@ class IDEControl:
     def send_keys(self, app_name: str, text: str) -> bool:
         """Send text + Enter to IDE terminal (clipboard paste, supports CJK)
 
+        ⚠️ 仅适用于 IDE 内嵌终端（IntelliJ 等持有 pty 的场景）——macOS 上
+        无无头注入通道（do script 只能达 Terminal.app tab，TIOCSTI 非 root
+        被 ENOTTY 拒绝），只能走焦点注入。锁屏时击键不可达，先检测再发，
+        避免假成功（osascript 本身会成功返回，用户却什么都没发生）。
+
         Args:
             app_name: Process name (e.g. "IntelliJ IDEA", "Code")
             text: Text to send (auto-appends Enter)
@@ -269,6 +274,9 @@ class IDEControl:
         Returns:
             True if successful
         """
+        if self._screen_locked():
+            logger.warning("send_keys(%s) aborted: screen locked", app_name)
+            return False
         script = f"""
         tell application "{app_name}"
             activate
@@ -302,6 +310,9 @@ class IDEControl:
 
     def send_text(self, app_name: str, text: str) -> bool:
         """Send plain text, no Enter appended (clipboard paste for CJK support)"""
+        if self._screen_locked():
+            logger.warning("send_text(%s) aborted: screen locked", app_name)
+            return False
         script = f"""
         tell application "{app_name}"
             activate
@@ -330,6 +341,9 @@ class IDEControl:
 
     def send_enter(self, app_name: str) -> bool:
         """Send Enter key"""
+        if self._screen_locked():
+            logger.warning("send_enter(%s) aborted: screen locked", app_name)
+            return False
         script = f"""
         tell application "{app_name}"
             activate
@@ -352,6 +366,9 @@ class IDEControl:
 
     def send_ctrl_c(self, app_name: str) -> bool:
         """Send Ctrl+C (SIGINT, 中断前台进程)"""
+        if self._screen_locked():
+            logger.warning("send_ctrl_c(%s) aborted: screen locked", app_name)
+            return False
         script = f"""
         tell application "{app_name}"
             activate
@@ -451,6 +468,24 @@ class IDEControl:
     def _applescript_escape(s: str) -> str:
         """转义 AppleScript 字符串字面量（反斜杠 + 双引号）"""
         return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    @staticmethod
+    def _screen_locked() -> bool:
+        """检测 GUI 会话是否锁屏（IDE 焦点注入路径的前提）
+
+        锁屏时 System Events 的 frontmost 进程是 loginwindow——这是
+        macOS 上无需额外依赖的可靠判据（CGSessionCopyCurrentDictionary
+        需 pyobjc，系统 python3 已不带）。检测失败按未锁处理，不阻塞主流程。
+        """
+        try:
+            proc = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to get name of first application process whose frontmost is true'],
+                capture_output=True, text=True, timeout=3,
+            )
+            return proc.returncode == 0 and proc.stdout.strip().lower() == "loginwindow"
+        except Exception:
+            return False
 
     def send_keys_to_tty(self, tty: str, text: str) -> bool:
         """向 tty 对应的 Terminal tab 发送文本并提交（do script，无头）

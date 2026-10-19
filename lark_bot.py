@@ -148,8 +148,10 @@ class LarkBot:
                         "interrupt": self._interrupt_from_bot,
                         "stop": self._stop_from_bot}[action](s)
             verb = {"confirm": "Confirmed", "interrupt": "Interrupted", "stop": "Stopped"}[action]
-            icon = "⏹️" if action == "stop" else ("✅" if ok else "❌")
-            return f"{icon} {verb} `{sid[:8]}`" if ok else f"❌ {action} failed", ""
+            if not ok:
+                return f"❌ {action} failed{self._send_fail_hint(s)}", ""
+            icon = "⏹️" if action == "stop" else "✅"
+            return f"{icon} {verb} `{sid[:8]}`", ""
 
         if action == "pending":
             waiting = self.registry.list(status_filter="waiting")
@@ -358,7 +360,8 @@ class LarkBot:
                 return "❌ Session no longer exists. Exited compose mode."
             ok = await self._dispatch_send(s, "send", text)
             if not ok:
-                return f"❌ Send failed — session tab not found or unavailable. 用 `/status {compose_sid[:8]}` 检查"
+                return (f"❌ Send failed — session tab not found or unavailable. "
+                        f"用 `/status {compose_sid[:8]}` 检查{self._send_fail_hint(s)}")
             self.registry.update(compose_sid, status="running")
             ctx["selected"] = compose_sid
             label = s.get("name") or compose_sid[:8]
@@ -833,7 +836,8 @@ class LarkBot:
             return f"✅ Sent to {s.get('name', session_id[:8])}:\n```\n$ {text}\n```"
         # 失败主因是 tab 已关闭（terminal）或 tmux 会话消失（screen），
         # 无头 do script 路径不再依赖焦点，锁屏不会导致此失败
-        return f"❌ Send failed — session tab not found or unavailable. 用 `/status {session_id[:8]}` 检查"
+        return (f"❌ Send failed — session tab not found or unavailable. "
+                f"用 `/status {session_id[:8]}` 检查{self._send_fail_hint(s)}")
 
     async def _cmd_confirm(self, args: list[str], chat_id: str) -> str:
         if args:
@@ -975,6 +979,15 @@ class LarkBot:
         最前面的 tab（修复 /send 把消息发错会话的问题）。
         """
         return await send_to_session(self.ide_ctrl, self.screen_mgr, s, action, text)
+
+    @staticmethod
+    def _send_fail_hint(s: dict) -> str:
+        """发送失败的补充提示：IDE 会话锁屏不可注入，给出替代方案"""
+        if s.get("session_type") == "ide":
+            return ("\n💡 IDE 会话（🔌 内嵌终端）依赖焦点注入，锁屏时不可用、"
+                    "未锁屏但终端面板无焦点时也会落错位置。需要锁屏可靠操控的"
+                    "会话，请在对应目录用 `lcc` 启动（tmux 后端，完全无头）。")
+        return ""
 
     async def _resolve_target(self, arg: str, chat_id: str) -> Optional[str]:
         ctx = _session_context.get(chat_id)
