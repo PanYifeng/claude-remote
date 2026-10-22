@@ -22,9 +22,24 @@ import os
 import re
 import signal
 import subprocess
+import threading
+import time
 from typing import Optional
 
 logger = logging.getLogger("ide_control")
+
+# TUI 忙碌（生成中）的可识别痕迹：hint 栏出现 "esc to interrupt"，
+# 或 spinner 的耗时计数（"(4m 32s ·" / "(32s ·" / "(11m 41s · ↓ 36.7k tokens)"）
+# 注意 hint 栏并非总显示 esc to interrupt，spinner 计数是更可靠的信号
+_BUSY_PATTERNS = (
+    re.compile(r"esc to interrupt"),
+    re.compile(r"\((?:\d+m\s*)?\d+s\s*·"),
+)
+# 输入框下方的 hint 栏行（含 "auto mode on"），判断输入框位置时需排除
+_HINT_LINE = re.compile(r"auto mode on")
+# 输入框滞留检测的轮询参数：间隔 / 最长等待
+_SUBMIT_CHECK_INTERVAL = 10
+_SUBMIT_CHECK_MAX_ROUNDS = 90  # 10s × 90 = 15 分钟
 
 
 def read_claude_session_state(pid: int) -> Optional[dict]:
@@ -494,12 +509,79 @@ class IDEControl:
         多行：bracketed paste 整体粘贴后再补一个回车提交 —— 逐行连发
         do script 会被合并成带内嵌 \r 的单块，触发 TUI 的粘贴检测，
         内容滞留输入框不提交（2026-10-08 /send 多行失效根因）。
+
+        发送后异步验证是否真的提交：TUI 忙碌（生成中）时回车会被吞、
+        文本滞留输入框（消息排队失败）——后台线程会等会话空闲后自动
+        补一个回车完成提交（2026-10-22 根因，见 _ensure_submitted）。
         """
         if not text:
             return self.send_enter_to_tty(tty)
-        if "\n" not in text:
-            return self._do_script_to_tty(tty, [text])
-        return self._paste_multiline_to_tty(tty, text)
+        if "\n" in text:
+            ok = self._paste_multiline_to_tty(tty, text)
+        else:
+            ok = self._do_script_to_tty(tty, [text])
+        if ok:
+            self._ensure_submitted(tty, text)
+        return ok
+
+    def _ensure_submitted(self, tty: str, text: str) -> None:
+        """后台确认文本已提交；滞留输入框时等空闲后补回车（模拟排队）
+
+        TUI 生成中注入的回车会被吞掉，文本滞留输入框。此线程每 10s
+        读一次终端：忙碌→继续等；空闲且文本仍在输入框→补发回车并下轮
+        复核（防忙碌误判，最多补 3 次）；文本已进入转写区→退出。
+        最多等 15 分钟。
+        """
+        prefix = text.strip().split("\n")[0][:30]
+        attempts = 0
+
+        def worker() -> None:
+            nonlocal attempts
+            for _ in range(_SUBMIT_CHECK_MAX_ROUNDS):
+                time.sleep(_SUBMIT_CHECK_INTERVAL)
+                tail, _ = self.read_terminal_by_tty(tty, 25)
+                if not tail:
+                    return  # tab 已关闭
+                if self._tui_busy(tail):
+                    continue
+                if not self._text_in_input_box(tail, prefix):
+                    return  # 已提交（或已排队）
+                if attempts >= 3:
+                    logger.warning("ensure_submitted(%s): still stuck after 3 Enter attempts, give up", tty)
+                    return
+                attempts += 1
+                logger.info("ensure_submitted(%s): text stuck in input box, sending Enter (attempt %d)", tty, attempts)
+                self.send_enter_to_tty(tty)
+            logger.warning("ensure_submitted(%s): still busy after 15min, give up", tty)
+
+        threading.Thread(target=worker, daemon=True,
+                         name=f"ccr-submit-{tty}").start()
+
+    @staticmethod
+    def _tui_busy(tail: str) -> bool:
+        """判断终端尾部是否处于生成中（spinner / esc to interrupt 提示）"""
+        return any(p.search(tail) for p in _BUSY_PATTERNS)
+
+    @staticmethod
+    def _text_in_input_box(tail: str, prefix: str) -> bool:
+        """判断文本是否滞留在输入框（未提交）
+
+        输入框是屏幕最底部的 ❯ 行（hint 栏之上）。判定：prefix 出现在
+        最后一个 ❯ 行，且该行之后（排除 hint/分隔线）没有忙碌指示——
+        忙碌指示在文本行之下说明文本已提交进转写区、spinner 正在跑。
+        """
+        lines = tail.splitlines()
+        last_input_idx = -1
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].lstrip().startswith("❯"):
+                last_input_idx = i
+                break
+        if last_input_idx < 0 or prefix not in lines[last_input_idx]:
+            return False
+        after = [l for l in lines[last_input_idx + 1:]
+                 if l.strip() and not _HINT_LINE.search(l)
+                 and not set(l.strip()) <= {"─", "═", "━"}]
+        return not IDEControl._tui_busy("\n".join(after))
 
     def _paste_multiline_to_tty(self, tty: str, text: str) -> bool:
         """多行文本：ESC[200~ ... ESC[201~ 包裹整体粘贴 + 延迟补回车提交
