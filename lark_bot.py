@@ -20,7 +20,7 @@ from typing import Optional, List
 from config import config
 from registry import SessionRegistry
 from screen_manager import ScreenManager
-from ide_control import IDEControl
+from ide_control import IDEControl, session_tty
 from dispatch import send_to_session
 from lark_card import (
     session_list_card,
@@ -746,8 +746,20 @@ class LarkBot:
                     pass
                 await asyncio.sleep(1)
 
-        # Fallback: Terminal.app clipboard (reads frontmost window)
-        # This may show the wrong session if multiple terminals are open
+        # Fallback: 按 TTY 精确读取该会话自己的 Terminal tab（非侵入、不串台）
+        tty = session_tty(s)
+        if tty:
+            out, _ = self.ide_ctrl.read_terminal_by_tty(tty, 25)
+            if out:
+                lines = [l.strip() for l in out.splitlines()
+                         if l.strip() and not l.strip().startswith("─")
+                         and not l.strip().startswith("❯")
+                         and not l.strip().startswith("  ⏵")]
+                if lines:
+                    return "\n".join(lines[-20:])
+
+        # Last resort: Terminal.app clipboard (reads frontmost window)
+        # 仅当无 TTY 时使用，多窗口时可能读错会话
         try:
             for attempt in range(4):
                 await asyncio.sleep(1)
@@ -1029,10 +1041,12 @@ class LarkBot:
         if stype == "ide":
             return self.ide_ctrl.read_output(s.get("app_name", ""), 15)
         elif stype == "terminal":
-            # Try full scrollback first (clipboard capture) for richer output
-            output, lc = self.ide_ctrl.read_terminal_full_output(50)
+            # 按 TTY 精确读取该会话自己的 Terminal tab（非侵入、不抢焦点）。
+            # 不能用 read_terminal_full_output —— 它读的是最前台窗口，所有会话会串台
+            tty = session_tty(s)
+            output, lc = self.ide_ctrl.read_terminal_by_tty(tty, 50) if tty else ("", 0)
             if output:
-                # Filter out separator/prompt lines to show meaningful content
+                # 过滤分隔线/提示符行，只保留有意义的内容
                 lines = [l for l in output.splitlines()
                          if l.strip() and not l.strip().startswith("─")
                          and not l.strip().startswith("❯")
@@ -1041,7 +1055,7 @@ class LarkBot:
                     filtered = "\n".join(lines[-30:])
                     return filtered, len(lines)
                 return output, lc
-            # Fallback: log file
+            # 兜底：TTY 读不到（tab 已关闭等）时退回日志文件
             output, lc = await self.screen_mgr.read_output(session_id, 15)
             return output, lc
         return await self.screen_mgr.read_output(session_id, 15)
