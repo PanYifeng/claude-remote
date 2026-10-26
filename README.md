@@ -160,7 +160,7 @@ ls -la      → sent to session
 - Use number shortcuts: `/confirm 1`, `/status 2`, `/send 3 pwd`
 - `/confirm` or `/interrupt` without ID acts on last session
 - `/new <path>` creates a tmux session + log file for accurate output reading
-- `/send` to terminal sessions uses Terminal's `do script ... in tab` (headless: no focus, no clipboard, works with the screen locked; CJK text works natively). Single-line text submits directly; multi-line text is sent as a bracketed paste (ESC[200~ ... ESC[201~) followed by an Enter, so the TUI receives it as one message and submits it — line-by-line injection would coalesce into a paste-detected chunk that never submits
+- `/send` to terminal sessions uses Terminal's `do script ... in tab` (headless: no focus, no clipboard, works with the screen locked; CJK text works natively). All text (single- and multi-line) is sent as a bracketed paste (ESC[200~ ... ESC[201~) followed by a separate delayed Enter — a lone CR is never glued to the text chunk, because that triggers the TUI's paste detection and the message stays as an unsubmitted draft. With the split injection, messages submitted while the agent is generating are queued natively (both Claude Code and OpenCode support mid-generation queueing) and processed after the current task; a background verifier re-sends Enter only as a fallback if the text still sits in the input box
 - `/interrupt` on terminal sessions sends SIGINT to the tty's foreground process group — exactly equivalent to Ctrl+C, also works headless
 - ID supports fuzzy matching — first 8 chars are sufficient
 - `/exit --kill` updates the last interactive card with stop status

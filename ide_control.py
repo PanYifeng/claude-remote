@@ -507,34 +507,29 @@ class IDEControl:
     def send_keys_to_tty(self, tty: str, text: str) -> bool:
         """向 tty 对应的 Terminal tab 发送文本并提交（do script，无头）
 
-        单行：文本 + 回车一次写入（do script 自带 Return），与键盘输入一致。
-        多行：bracketed paste 整体粘贴后再补一个回车提交 —— 逐行连发
-        do script 会被合并成带内嵌 \r 的单块，触发 TUI 的粘贴检测，
-        内容滞留输入框不提交（2026-10-08 /send 多行失效根因）。
+        统一走 bracketed paste + 延迟独立回车：文本和回车挤在同一个
+        do script 里会触发 TUI 粘贴检测，尾部 CR 被当作粘贴内容吞掉、
+        文本滞留输入框（2026-10-08 多行 / 2026-10-26 单行复发根因）。
+        分离注入后，TUI 生成中也能直接提交 —— Claude Code 与 OpenCode
+        均原生支持忙碌中排队消息（2026-10-26 实测），无需等空闲。
 
-        发送后异步验证是否真的提交：TUI 忙碌（生成中）时回车会被吞、
-        文本滞留输入框（消息排队失败）——后台线程会等会话空闲后自动
-        补一个回车完成提交（2026-10-22 根因，见 _ensure_submitted）。
+        发送后仍有异步兜底验证（_ensure_submitted）：极端时序下回车
+        仍可能被吞，后台线程会检测滞留并补发回车。
         """
         if not text:
             return self.send_enter_to_tty(tty)
-        if "\n" in text:
-            ok = self._paste_multiline_to_tty(tty, text)
-        else:
-            ok = self._do_script_to_tty(tty, [text])
+        ok = self._paste_and_submit_to_tty(tty, text)
         if ok:
             self._ensure_submitted(tty, text)
         return ok
 
     def _ensure_submitted(self, tty: str, text: str) -> None:
-        """后台确认文本已提交；滞留输入框时等空闲后补回车（模拟排队）
+        """后台确认文本已提交；滞留输入框时补回车（异步兜底）
 
-        TUI 生成中注入的回车会被吞掉，文本滞留输入框（Enter 不会排队消息，
-        只会留在输入框成草稿）。此线程每 10s 读一次终端：
-        忙碌→继续等（不消耗预算 —— 长任务可能跑几十分钟，固定 15 分钟
-        窗口会在任务结束前放弃，2026-10-26 复发根因）；空闲且文本仍在
-        输入框→补发回车并下轮复核（防忙碌误判，最多补 3 次）；文本已
-        进入转写区→退出。忙碌最长等 2 小时，空闲滞留最多观察 5 分钟。
+        主路径（bracketed paste + 独立 CR）在 TUI 生成中也能直接排队
+        （2026-10-26 实测 Claude Code 与 OpenCode 均支持）。此线程只作
+        极端时序的兜底：回车若被吞、文本滞留输入框，等忙碌结束后补
+        发回车（最多 3 次，防误判）；文本已排队/提交则立即退出。
         """
         prefix = text.strip().split("\n")[0][:30]
 
@@ -599,18 +594,18 @@ class IDEControl:
                  and not set(l.strip()) <= {"─", "═", "━"}]
         return not IDEControl._tui_busy("\n".join(after))
 
-    def _paste_multiline_to_tty(self, tty: str, text: str) -> bool:
-        """多行文本：ESC[200~ ... ESC[201~ 包裹整体粘贴 + 延迟补回车提交
+    def _paste_and_submit_to_tty(self, tty: str, text: str) -> bool:
+        """任意文本（单行/多行）：ESC[200~ ... ESC[201~ 包裹整体粘贴 + 延迟补回车提交
 
-        bracketed paste 让 TUI 把多行内容作为一个整体放进输入框（不逐行
-        触发提交）；粘贴结束后单独补一个回车完成提交。粘贴语句自带的
-        尾随 Return 已在 ESC[201~ 之后，可作为第一次提交；延迟 0.15s 的
-        空串 do script 是保险（TUI 空输入时回车无副作用）。
+        bracketed paste 让 TUI 把内容作为一个整体放进输入框（不触发
+        提交、不逐行解析）；粘贴结束后延迟 0.3s 用独立的空串 do script
+        （= 纯 CR）提交 —— 与文本分离的回车不会被粘贴检测吞掉，生成中
+        也能排队。延迟取 0.3s：实测 0.15s 偶发与粘贴块粘连。
         """
         paste_expr = " & ".join(self._bracketed_paste_parts(text))
         statements = [
             f"do script {paste_expr} in theTab",
-            "delay 0.15",
+            "delay 0.3",
             'do script "" in theTab',
         ]
         return self._run_in_tty_tab(tty, statements)

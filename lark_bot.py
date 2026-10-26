@@ -995,17 +995,18 @@ class LarkBot:
         return await send_to_session(self.ide_ctrl, self.screen_mgr, s, action, text)
 
     def _busy_note(self, s: dict) -> str:
-        """发送后检查会话是否忙碌，忙碌时提示内容将自动提交
+        """发送后检查会话是否忙碌，忙碌时提示消息已排队
 
-        TUI 生成中回车会被吞、文本滞留输入框；后台验证线程会等空闲后
-        自动补回车。提前告知用户，避免 ✅ 造成"已提交"的误解。
+        Claude Code / OpenCode 均支持生成中提交新消息（自动排队，
+        当前任务结束后处理）。忙碌中的提示语与空闲时区分，避免用户
+        误以为消息会在本轮立即生效。
         """
         tty = session_tty(s)
         if not tty or s.get("session_type") not in ("terminal", "standalone"):
             return ""
         tail, _ = self.ide_ctrl.read_terminal_by_tty(tty, 15)
         if tail and IDEControl._tui_busy(tail):
-            return "\n\n⏳ 会话正在执行中：内容已注入输入框，将在空闲时自动提交。"
+            return "\n\n⏳ 会话正在执行中：消息已排队，将在当前任务结束后处理。"
         return ""
 
     @staticmethod
