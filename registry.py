@@ -89,6 +89,22 @@ class SessionRegistry:
         Returns:
             完整 session 记录
         """
+        # 按 TTY 去重：agent 在同一终端 tab 重启后 pid 变、tty 不变，
+        # 不清旧记录会持续累积重复注册（screen 会话无 tty，不受影响）。
+        # 注意须在下方 with self._lock 之外执行（锁不可重入）。
+        new_tty = tags.get("tty", "") if isinstance(tags, dict) else ""
+        if new_tty and session_type in ("terminal", "ide"):
+            for old in self.list():
+                if old.get("session_type") not in ("terminal", "ide"):
+                    continue
+                old_tags = old.get("tags", {})
+                if isinstance(old_tags, str):
+                    try:
+                        old_tags = json.loads(old_tags)
+                    except (json.JSONDecodeError, ValueError):
+                        old_tags = {}
+                if isinstance(old_tags, dict) and old_tags.get("tty") == new_tty:
+                    self.delete(old["id"])
         now = time.time()
         row = {
             "id": session_id,
