@@ -228,6 +228,7 @@ Each session in `/l` shows:
 ├── com.dp.claude-remote.plist  # LaunchAgent template (auto-start + KeepAlive)
 ├── ide-register        # Register an existing IDE/terminal claude session
 ├── scan-existing       # Scan & register existing claude/opencode processes with heartbeat daemon
+├── cleanup_registry.py # Prune stale sessions (dead pid / gone tmux) — dry-run by default
 ├── LICENSE             # MIT License
 └── README.md           # This file
 ```
