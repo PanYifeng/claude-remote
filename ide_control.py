@@ -39,7 +39,9 @@ _BUSY_PATTERNS = (
 _HINT_LINE = re.compile(r"auto mode on")
 # 输入框滞留检测的轮询参数：间隔 / 最长等待
 _SUBMIT_CHECK_INTERVAL = 10
-_SUBMIT_CHECK_MAX_ROUNDS = 90  # 10s × 90 = 15 分钟
+_SUBMIT_BUSY_MAX_ROUNDS = 720   # 忙碌最长等 2 小时（长任务不放弃）
+_SUBMIT_IDLE_MAX_ROUNDS = 30    # 空闲后最多再观察 5 分钟
+_SUBMIT_ENTER_MAX = 3           # 补回车次数上限
 
 
 def read_claude_session_state(pid: int) -> Optional[dict]:
@@ -527,32 +529,46 @@ class IDEControl:
     def _ensure_submitted(self, tty: str, text: str) -> None:
         """后台确认文本已提交；滞留输入框时等空闲后补回车（模拟排队）
 
-        TUI 生成中注入的回车会被吞掉，文本滞留输入框。此线程每 10s
-        读一次终端：忙碌→继续等；空闲且文本仍在输入框→补发回车并下轮
-        复核（防忙碌误判，最多补 3 次）；文本已进入转写区→退出。
-        最多等 15 分钟。
+        TUI 生成中注入的回车会被吞掉，文本滞留输入框（Enter 不会排队消息，
+        只会留在输入框成草稿）。此线程每 10s 读一次终端：
+        忙碌→继续等（不消耗预算 —— 长任务可能跑几十分钟，固定 15 分钟
+        窗口会在任务结束前放弃，2026-10-26 复发根因）；空闲且文本仍在
+        输入框→补发回车并下轮复核（防忙碌误判，最多补 3 次）；文本已
+        进入转写区→退出。忙碌最长等 2 小时，空闲滞留最多观察 5 分钟。
         """
         prefix = text.strip().split("\n")[0][:30]
-        attempts = 0
 
         def worker() -> None:
-            nonlocal attempts
-            for _ in range(_SUBMIT_CHECK_MAX_ROUNDS):
+            busy_rounds = 0
+            idle_rounds = 0
+            attempts = 0
+            while True:
                 time.sleep(_SUBMIT_CHECK_INTERVAL)
                 tail, _ = self.read_terminal_by_tty(tty, 25)
                 if not tail:
                     return  # tab 已关闭
                 if self._tui_busy(tail):
+                    busy_rounds += 1
+                    idle_rounds = 0
+                    if busy_rounds == 6:
+                        logger.info("ensure_submitted(%s): session busy, text waiting in input box", tty)
+                    if busy_rounds >= _SUBMIT_BUSY_MAX_ROUNDS:
+                        logger.warning("ensure_submitted(%s): still busy after 2h, give up", tty)
+                        return
                     continue
                 if not self._text_in_input_box(tail, prefix):
-                    return  # 已提交（或已排队）
-                if attempts >= 3:
+                    if busy_rounds:
+                        logger.info("ensure_submitted(%s): submitted after %dm busy wait",
+                                    tty, busy_rounds // 6)
+                    return  # 已提交（或用户已改动输入框）
+                idle_rounds += 1
+                if attempts >= _SUBMIT_ENTER_MAX or idle_rounds > _SUBMIT_IDLE_MAX_ROUNDS:
                     logger.warning("ensure_submitted(%s): still stuck after 3 Enter attempts, give up", tty)
                     return
                 attempts += 1
-                logger.info("ensure_submitted(%s): text stuck in input box, sending Enter (attempt %d)", tty, attempts)
+                logger.info("ensure_submitted(%s): text stuck in input box, sending Enter (attempt %d)",
+                            tty, attempts)
                 self.send_enter_to_tty(tty)
-            logger.warning("ensure_submitted(%s): still busy after 15min, give up", tty)
 
         threading.Thread(target=worker, daemon=True,
                          name=f"ccr-submit-{tty}").start()

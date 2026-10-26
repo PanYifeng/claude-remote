@@ -365,7 +365,8 @@ class LarkBot:
             self.registry.update(compose_sid, status="running")
             ctx["selected"] = compose_sid
             label = s.get("name") or compose_sid[:8]
-            return f"✅ Sent to {label}:\n```\n$ {text}\n```"
+            return (f"✅ Sent to {label}:\n```\n$ {text}\n```"
+                    f"{self._busy_note(s)}")
 
         # Normal command processing
         if not text.startswith("/"):
@@ -845,7 +846,8 @@ class LarkBot:
         if ok:
             self.registry.update(session_id, status="running")
             _session_context.setdefault(chat_id, {})["selected"] = session_id
-            return f"✅ Sent to {s.get('name', session_id[:8])}:\n```\n$ {text}\n```"
+            return (f"✅ Sent to {s.get('name', session_id[:8])}:\n```\n$ {text}\n```"
+                    f"{self._busy_note(s)}")
         # 失败主因是 tab 已关闭（terminal）或 tmux 会话消失（screen），
         # 无头 do script 路径不再依赖焦点，锁屏不会导致此失败
         return (f"❌ Send failed — session tab not found or unavailable. "
@@ -991,6 +993,20 @@ class LarkBot:
         最前面的 tab（修复 /send 把消息发错会话的问题）。
         """
         return await send_to_session(self.ide_ctrl, self.screen_mgr, s, action, text)
+
+    def _busy_note(self, s: dict) -> str:
+        """发送后检查会话是否忙碌，忙碌时提示内容将自动提交
+
+        TUI 生成中回车会被吞、文本滞留输入框；后台验证线程会等空闲后
+        自动补回车。提前告知用户，避免 ✅ 造成"已提交"的误解。
+        """
+        tty = session_tty(s)
+        if not tty or s.get("session_type") not in ("terminal", "standalone"):
+            return ""
+        tail, _ = self.ide_ctrl.read_terminal_by_tty(tty, 15)
+        if tail and IDEControl._tui_busy(tail):
+            return "\n\n⏳ 会话正在执行中：内容已注入输入框，将在空闲时自动提交。"
+        return ""
 
     @staticmethod
     def _send_fail_hint(s: dict) -> str:
