@@ -168,6 +168,8 @@ ls -la      → sent to session
 
 Card button clicks require the Lark app to subscribe the `card.action.trigger` event (same event-consume mechanism as messages — no webhook needed).
 
+> **⚠️ Mac sleep and event delivery.** When the Mac sleeps, the Lark event connection goes down but the consumer processes stay alive in a zombie state — incoming messages are silently dropped until the pipeline is restarted. The daemon ships a wake watchdog: after the system wakes (wall-clock jump), it kills the consumers and the event bus and rebuilds fresh connections within seconds, so messages sent *after* the wake are delivered normally (DarkWake maintenance windows self-heal the same way). Events pushed *while* the Mac is asleep cannot be recovered (Lark does not redeliver) — if you need the bot reachable overnight, prevent sleep (e.g. `caffeinate`, or keep the Mac plugged in with display sleep only).
+
 ## Session Types / 会话类型
 
 Sessions are tagged by **agent** (Claude 🟦/💻 vs OpenCode 🟦) and **type** (how it runs):

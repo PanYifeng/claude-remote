@@ -61,6 +61,9 @@ class Daemon:
         self._health_task: Optional[asyncio.Task] = None
         self._event_task: Optional[asyncio.Task] = None
         self._card_event_task: Optional[asyncio.Task] = None
+        self._wake_watchdog_task: Optional[asyncio.Task] = None
+        # 各事件 key 当前存活的 consumer 进程（唤醒看门狗用）
+        self._consumer_procs: dict[str, Optional[asyncio.subprocess.Process]] = {}
         self._session_write_locks: dict[str, asyncio.Lock] = {}
 
     def _setup_routes(self) -> None:
@@ -709,6 +712,7 @@ class Daemon:
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,  # 新进程组 → killpg 杀整棵树（node+lark-cli+_bus），防孤儿泄露
                 )
+                self._consumer_procs[event_key] = proc
                 logger.info("Event consume started (%s, PID: %d)", event_key, proc.pid)
                 stdin_keepalive = proc.stdin  # 防 GC 关 pipe（lark-cli 遇 stdin EOF 退出）
 
@@ -742,6 +746,9 @@ class Daemon:
             except Exception as e:
                 logger.error("Event consume error (%s): %s", event_key, e)
                 await self._kill_proc_tree(proc)
+            finally:
+                if self._consumer_procs.get(event_key) is proc:
+                    self._consumer_procs[event_key] = None
             await asyncio.sleep(5)
 
     async def _kill_proc_tree(self, proc) -> None:
@@ -756,6 +763,50 @@ class Daemon:
             await asyncio.wait_for(proc.wait(), timeout=2)
         except asyncio.TimeoutError:
             pass
+
+    async def _wake_watchdog(self) -> None:
+        """检测系统睡眠唤醒，恢复僵死的 Lark 事件链路
+
+        Mac 睡眠时 event bus 与飞书服务器的 TCP 断开，但 bus/consumer
+        进程不死、僵尸连接不重建，唤醒后事件永远不会到达 —— 2026-10-27
+        23:33 /l 无响应根因（Mac 23:27 idle sleep，事件链路僵死至次日
+        手动重启）。看门狗每 30s 记录墙钟； asyncio 在睡眠期间挂起，
+        唤醒后观测到 >2min 的时间跳变即判定"刚唤醒"，立即杀 consumer
+        树并强制重启 event bus，consume 循环 5s 内自动重建全新链路
+        （DarkWake 维护唤醒窗口同样会触发，尽早自愈）。
+        睡眠期间推送的事件无法找回（Lark 不重发），这是消费模型的
+        固有限制。
+        """
+        last = time.time()
+        while self._running:
+            await asyncio.sleep(30)
+            now = time.time()
+            gap = now - last
+            last = now
+            if gap <= 120:
+                continue
+            logger.warning("System wake detected (paused %.0f min), restarting Lark event pipeline",
+                           gap / 60)
+            await self._restart_event_pipeline()
+
+    async def _restart_event_pipeline(self) -> None:
+        """杀 consumer 进程树 + 强制重启 event bus（清除睡眠僵死的 TCP）"""
+        for key, proc in list(self._consumer_procs.items()):
+            self._consumer_procs[key] = None
+            await self._kill_proc_tree(proc)
+        # bus 是独立常驻进程（跨 daemon 重启存活），僵尸 TCP 必须显式重启；
+        # consumer 全部退出后 --force 不再需要，但带上以防竞态
+        try:
+            stopper = await asyncio.create_subprocess_exec(
+                "lark-cli", "event", "stop", "--force",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(stopper.wait(), timeout=15)
+        except Exception as e:
+            logger.warning("event bus stop failed: %s", e)
+        # consumer 循环 5s 后自动 respawn；新 consumer 启动时若 bus 不在
+        # 会自动拉起新 bus，全部走新建 TCP
 
     async def start(self):
         self._start_time = time.time()
@@ -801,6 +852,8 @@ class Daemon:
             self.event_consume_loop("card.action.trigger", self.lark_bot.handle_card_event),
             name="lark-card",
         )
+        # 唤醒看门狗：睡眠唤醒后重建僵死的事件链路
+        self._wake_watchdog_task = asyncio.create_task(self._wake_watchdog(), name="wake-watchdog")
 
         logger.info("Daemon started on http://127.0.0.1:%d", config.daemon_port)
 
@@ -812,6 +865,7 @@ class Daemon:
             if self._health_task: self._health_task.cancel()
             if self._event_task: self._event_task.cancel()
             if self._card_event_task: self._card_event_task.cancel()
+            if self._wake_watchdog_task: self._wake_watchdog_task.cancel()
 
     @staticmethod
     def _json(data, status=200):
