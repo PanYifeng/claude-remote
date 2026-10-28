@@ -168,7 +168,11 @@ ls -la      → sent to session
 
 Card button clicks require the Lark app to subscribe the `card.action.trigger` event (same event-consume mechanism as messages — no webhook needed).
 
-> **⚠️ Mac sleep and event delivery.** When the Mac sleeps, the Lark event connection goes down but the consumer processes stay alive in a zombie state — incoming messages are silently dropped until the pipeline is restarted. The daemon ships a wake watchdog: after the system wakes (wall-clock jump), it kills the consumers and the event bus and rebuilds fresh connections within seconds, so messages sent *after* the wake are delivered normally (DarkWake maintenance windows self-heal the same way). Events pushed *while* the Mac is asleep cannot be recovered (Lark does not redeliver) — if you need the bot reachable overnight, prevent sleep (e.g. `caffeinate`, or keep the Mac plugged in with display sleep only).
+> **⚠️ Mac sleep and event delivery.** When the Mac sleeps, the Lark event connection goes down but the consumer processes stay alive in a zombie state — incoming messages are silently dropped until the pipeline is restarted. Two layers of protection:
+> 1. **Sleep prevention (default on):** the daemon runs `caffeinate -i -s` for its lifetime, preventing idle sleep (lid-close and manual sleep are unaffected). Set `CCR_PREVENT_SLEEP=0` to disable. Note: on battery this drains the battery overnight — plug in if you leave it running.
+> 2. **Wake watchdog:** after the system wakes (wall-clock jump), the daemon kills the consumers and the event bus and rebuilds fresh connections within seconds (DarkWake maintenance windows self-heal the same way), so messages sent *after* the wake are delivered normally.
+>
+> Events pushed *while* the Mac is asleep (lid closed or manually slept) cannot be recovered — Lark does not redeliver.
 
 ## Session Types / 会话类型
 
@@ -240,6 +244,7 @@ Each session in `/l` shows:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CCR_DAEMON_PORT` | `9998` | Daemon HTTP port |
+| `CCR_PREVENT_SLEEP` | `1` | Run `caffeinate` to prevent idle sleep while the daemon runs (`0` to disable) |
 | `CCR_DATA_DIR` | `~/.claude-remote` | Data storage directory |
 | `CCR_LOG_PATH` | `/tmp/claude-daemon.log` | Log file path |
 | `CCR_DAEMON_URL` | `http://localhost:9998` | Daemon URL (used by `lcc`/`loc`) |

@@ -64,6 +64,7 @@ class Daemon:
         self._wake_watchdog_task: Optional[asyncio.Task] = None
         # 各事件 key 当前存活的 consumer 进程（唤醒看门狗用）
         self._consumer_procs: dict[str, Optional[asyncio.subprocess.Process]] = {}
+        self._caffeinate_proc: Optional[asyncio.subprocess.Process] = None
         self._session_write_locks: dict[str, asyncio.Lock] = {}
 
     def _setup_routes(self) -> None:
@@ -854,6 +855,8 @@ class Daemon:
         )
         # 唤醒看门狗：睡眠唤醒后重建僵死的事件链路
         self._wake_watchdog_task = asyncio.create_task(self._wake_watchdog(), name="wake-watchdog")
+        # caffeinate 阻止 idle sleep（daemon 存续期间事件链路常在）
+        await self._start_caffeinate()
 
         logger.info("Daemon started on http://127.0.0.1:%d", config.daemon_port)
 
@@ -866,6 +869,46 @@ class Daemon:
             if self._event_task: self._event_task.cancel()
             if self._card_event_task: self._card_event_task.cancel()
             if self._wake_watchdog_task: self._wake_watchdog_task.cancel()
+            await self._stop_caffeinate()
+
+    async def _start_caffeinate(self) -> None:
+        """拉起 caffeinate 阻止系统 idle sleep（CCR_PREVENT_SLEEP=0 可关）
+
+        Lark 事件链路依赖常驻 TCP：Mac 一旦 idle sleep 连接即僵死、
+        睡眠期间推送的事件不可重发（2026-10-27 23:33 /l 丢失根因）。
+        -i 阻止 idle sleep（含电池）；-s 阻止 AC 电源下的系统睡眠。
+        进程随 daemon 退出自动释放断言，恢复系统默认行为；
+        合盖睡眠 / 手动睡眠不受影响（那种场景 wake watchdog 兜底）。
+        """
+        if not config.prevent_sleep:
+            logger.info("Sleep prevention disabled (CCR_PREVENT_SLEEP=0)")
+            return
+        try:
+            self._caffeinate_proc = await asyncio.create_subprocess_exec(
+                "caffeinate", "-i", "-s",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            logger.info("caffeinate started (PID: %d) — idle sleep prevented while daemon runs",
+                        self._caffeinate_proc.pid)
+        except FileNotFoundError:
+            logger.warning("caffeinate not found, idle sleep NOT prevented")
+        except Exception as e:
+            logger.warning("caffeinate failed to start: %s", e)
+
+    async def _stop_caffeinate(self) -> None:
+        """daemon 退出时结束 caffeinate，恢复系统默认睡眠行为"""
+        proc = self._caffeinate_proc
+        self._caffeinate_proc = None
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=3)
+            logger.info("caffeinate stopped — sleep prevention released")
+        except Exception:
+            pass
 
     @staticmethod
     def _json(data, status=200):

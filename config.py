@@ -20,6 +20,9 @@ class Config:
     lark_user_id: Optional[str] = os.getenv("CCR_LARK_USER_ID")
     tunnel_domain: Optional[str] = os.getenv("CCR_TUNNEL_DOMAIN")
     log_path: str = os.getenv("CCR_LOG_PATH", "/tmp/claude-daemon.log")
+    # daemon 运行期间用 caffeinate 阻止系统 idle sleep（Lark 事件链路依赖常驻连接；
+    # 睡眠会掐断 TCP 且事件不可重发。合盖/手动睡眠不受影响）
+    prevent_sleep: bool = os.getenv("CCR_PREVENT_SLEEP", "1") != "0"
     health_check_interval: float = 5.0
     waiting_timeout: float = 5.0
     output_tail_lines: int = 50
