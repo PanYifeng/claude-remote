@@ -1056,6 +1056,18 @@ class LarkBot:
         stype = s.get("session_type", "screen")
         session_id = s["id"]
         if stype == "ide":
+            # IDE 会话：优先读权威数据（per-pid 状态文件 + transcript 最后一条
+            # assistant 消息）——剪贴板抓屏（read_output）依赖 activate+焦点，
+            # 多窗口/复制残留时会串台（2026-11-02 状态卡片显示别的会话内容）。
+            # 抓屏仅作状态文件缺失时的兜底。
+            from ide_control import read_claude_session_state, read_last_assistant_message
+            pid = s.get("pid", 0)
+            cs = read_claude_session_state(pid) if pid else None
+            if cs:
+                sid = cs.get("sessionId", "")
+                text, _ = read_last_assistant_message(s.get("cwd", ""), sid)
+                if text:
+                    return text, len(text.splitlines())
             return self.ide_ctrl.read_output(s.get("app_name", ""), 15)
         elif stype == "terminal":
             # 按 TTY 精确读取该会话自己的 Terminal tab（非侵入、不抢焦点）。
