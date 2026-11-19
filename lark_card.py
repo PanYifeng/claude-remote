@@ -154,17 +154,25 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
             _btn("🔁 循环一步", "cycle-mode", s["id"]),
             _btn("🚫 Esc", "esc", s["id"]),
         ]))
-    # 模型切换：精选实测可用模型按钮（当前模型高亮）
+    # 模型切换：按分组友好展示（GLM / DeepSeek / Kimi / GPT / Claude），
+    # 当前模型高亮；组名做分隔行
     if s.get("agent", "claude") == "claude":
-        from model_control import collect_known_models
-        model_btns = []
-        for m in collect_known_models([])[:5]:
-            short = m.split("/")[-1]
-            model_btns.append(_btn(short, "set-model", s["id"],
-                                   "primary" if m == model else "default", {"m": m}))
-        if model_btns:
-            elements.append(_btn_row(model_btns[:3]))
-            elements.append(_btn_row(model_btns[3:]))
+        from model_control import _CURATED_MODEL_GROUPS
+        for group_name, group_models in _CURATED_MODEL_GROUPS.items():
+            btns = []
+            for m in group_models:
+                short = m.split("/")[-1]
+                btns.append(_btn(short, "set-model", s["id"],
+                                 "primary" if m == model else "default", {"m": m}))
+            if btns:
+                elements.append(_md(f"**{group_name}**"))
+                elements.append(_btn_row(btns[:3]))
+                if len(btns) > 3:
+                    elements.append(_btn_row(btns[3:]))
+        # 手动输入：compose 模式发 '/setmodel <id> <model>'
+        elements.append(_md(
+            f"✏️ 其他模型: `/setmodel {sid} <model>` 手动输入"
+            f"（网关不区分大小写）"))
     # 保留一条可复制的 /send 命令行（compose 模式之外的手动用法）
     elements.append(_cmd(f"/send {sid} "))
 

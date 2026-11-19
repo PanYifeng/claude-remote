@@ -56,21 +56,23 @@ def read_session_model(cwd: str, session_id: str) -> str:
     return ""
 
 
-# 实测可用模型（2026-11-19 网关探测：Anthropic 协议全部 OK）。
-# 旧的 Vendor3/glm-5.1 已 404 下线；Vendor2/GLM-5.1 走 Anthropic 协议 400。
-_CURATED_MODELS = [
-    "GLM-5.3-flash",
-    "DeepSeek-V4.1-Flash-1017",
-    "Vendor3/glm-5",
-    "Vendor3/MiniMax-M2.5",
-    "Vendor2/Claude-4.8-opus",
-]
+# 精选模型分组（2026-11-19 网关实测：Anthropic 协议全部 OK）。
+# 旧的 Vendor3/glm-5.1 已 404 下线；Vendor2/GLM-5.1 走 Anthropic 协议 400；
+# Vendor3/glm-5、Vendor3/MiniMax-M2.5 按用户要求剔除。
+# 分组用于卡片按行友好展示；每组 2-3 个，当前模型在组内高亮。
+_CURATED_MODEL_GROUPS: dict[str, list[str]] = {
+    "GLM": ["GLM-5.3", "GLM-5.3-flash"],
+    "DeepSeek": ["DeepSeek-V4.1-Flash-1017"],
+    "Kimi": ["Vendor2/Kimi-k2.6", "Vendor3/kimi-k2.5"],
+    "GPT": ["Vendor2/GPT-5.5", "Vendor2/GPT-5.3-codex", "Vendor2/GPT-5-mini"],
+    "Claude": ["Vendor2/Claude-4.8-opus"],
+}
 
 
 def collect_known_models(active_sessions: list[dict]) -> list[str]:
     """收集候选模型列表（去重、保序）
 
-    来源：精选实测可用列表 + settings.json env 的模型配置 + 各活跃会话
+    来源：精选分组列表 + settings.json env 的模型配置 + 各活跃会话
     当前实际在用的模型。精选列表排最前（真实可用、直接可选）。
 
     Args:
@@ -79,7 +81,7 @@ def collect_known_models(active_sessions: list[dict]) -> list[str]:
     Returns:
         模型名列表，空则返回默认建议
     """
-    models: list[str] = list(_CURATED_MODELS)
+    models: list[str] = [m for group in _CURATED_MODEL_GROUPS.values() for m in group]
     # settings.json env 里的模型配置
     for env_key in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
                     "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"):

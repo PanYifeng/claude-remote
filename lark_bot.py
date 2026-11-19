@@ -1102,11 +1102,22 @@ class LarkBot:
             return "❌ 仅 Claude Code 会话支持模型切换"
         current = self._read_model(s)
         if len(args) < 2:
-            from model_control import collect_known_models
-            candidates = collect_known_models(self.registry.list())
-            lines = [f"当前模型: `{current or '未知'}` (`{session_id[:8]}`)", "", "候选模型:"]
-            lines += [f"  • `{m}`" + (" ← 当前" if m == current else "") for m in candidates]
-            lines.append(f"\n切换: `/setmodel {session_id[:8]} <model>`")
+            from model_control import _CURATED_MODEL_GROUPS, collect_known_models
+            lines = [f"当前模型: `{current or '未知'}` (`{session_id[:8]}`)", ""]
+            # 分组展示精选模型
+            for group_name, group_models in _CURATED_MODEL_GROUPS.items():
+                lines.append(f"**{group_name}**")
+                lines += [f"  • `{m}`" + (" ← 当前" if m == current else "")
+                         for m in group_models]
+            # 其他已知模型（settings env + 会话在用）
+            curated = {m for g in _CURATED_MODEL_GROUPS.values() for m in g}
+            others = [m for m in collect_known_models(self.registry.list())
+                      if m not in curated]
+            if others:
+                lines.append("**其他**")
+                lines += [f"  • `{m}`" + (" ← 当前" if m == current else "")
+                          for m in others]
+            lines.append(f"\n切换: `/setmodel {session_id[:8]} <model>`（支持手动输入任意模型名）")
             return "\n".join(lines)
         # 切换：TUI 斜杠命令直接生效（实测无需对话框交互）
         model = " ".join(args[1:])
@@ -1117,10 +1128,19 @@ class LarkBot:
                 f"⚠️ 注意：TUI 会把它保存为所有新会话的默认模型")
 
     async def _cmd_models(self, _args: list[str], chat_id: str) -> str:
-        """列出所有已知候选模型"""
-        from model_control import collect_known_models
-        candidates = collect_known_models(self.registry.list())
-        return "已知模型:\n" + "\n".join(f"  • `{m}`" for m in candidates)
+        """列出所有已知候选模型（分组展示）"""
+        from model_control import _CURATED_MODEL_GROUPS, collect_known_models
+        lines = []
+        for group_name, group_models in _CURATED_MODEL_GROUPS.items():
+            lines.append(f"**{group_name}**")
+            lines += [f"  • `{m}`" for m in group_models]
+        curated = {m for g in _CURATED_MODEL_GROUPS.values() for m in g}
+        others = [m for m in collect_known_models(self.registry.list())
+                  if m not in curated]
+        if others:
+            lines.append("**其他**")
+            lines += [f"  • `{m}`" for m in others]
+        return "\n".join(lines)
 
     def _read_model(self, s: dict) -> str:
         """读取会话当前模型（transcript 最后一条 assistant 的 model）"""
