@@ -99,6 +99,17 @@ class ScreenManager:
         """Send Ctrl+C"""
         return await self._send_key(session_id, "C-c")
 
+    # 原始按键名 → tmux send-keys 键名
+    _RAW_KEYS = {"esc": "Escape", "shift_tab": "BTab", "up": "Up", "down": "Down"}
+
+    async def send_raw_key(self, session_id: str, key: str) -> bool:
+        """Send a raw special key (Escape / BTab / Up / Down) to tmux session"""
+        tmux_key = self._RAW_KEYS.get(key)
+        if not tmux_key:
+            logger.warning("send_raw_key: unknown key %r", key)
+            return False
+        return await self._send_key(session_id, tmux_key)
+
     async def send_ctrl_d(self, session_id: str) -> bool:
         """Send Ctrl+D (EOF)"""
         return await self._send_key(session_id, "C-d")

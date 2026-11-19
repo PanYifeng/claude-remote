@@ -3,7 +3,7 @@
 Uses lark-cli event consumption instead of webhook:
 - Receives messages via `lark-cli event consume im.message.receive_v1 --as bot`
 - Receives card button clicks via `lark-cli event consume card.action.trigger --as bot`
-- Sends replies via `lark-cli im send` and interactive cards
+- Sends replies via `lark-cli im +messages-send` and interactive cards
 
 No Cloudflare tunnel or public webhook required.
 """
@@ -50,6 +50,8 @@ COMMAND_HELP = """
 /confirm-all                  — Confirm all waiting sessions
 /select <id|N> <n>            — Select option N
 /interrupt [id|N]             — Send Ctrl+C. No arg = last session
+/mode <id|N> [mode]           — Show / set permission mode (auto|manual|accept-edits|plan|next)
+/esc [id|N]                   — Send Esc (close dialog / cancel selection)
 /stop <id|N>                  — Stop session
 /daemon (stop|restart|status) — Control daemon service
 /help                         — Show this help
@@ -91,6 +93,12 @@ class LarkBot:
             if not content or not chat_id:
                 logger.warning("Skipping event: content=%s chat_id=%s", bool(content), bool(chat_id))
                 return None
+            # 图片引用（![Image](img_v3_xxx)）下载到本地并替换为文件路径，
+            # 让终端会话里的智能体能真正读到图
+            from image_resources import has_image_refs, replace_image_refs
+            if has_image_refs(content):
+                content = await asyncio.to_thread(
+                    replace_image_refs, content, message_id)
             response = await self._process_command(content.strip(), chat_id)
             if response:
                 await self._reply_message(chat_id, message_id, response)
@@ -115,7 +123,7 @@ class LarkBot:
                 logger.warning("Card event missing action/chat: keys=%s", list(event.keys()))
                 return None
 
-            text, card = await self._run_card_action(action, sid, chat_id)
+            text, card = await self._run_card_action(action, sid, chat_id, info.get("extra"))
             if card:
                 # 优先原位更新被点击的卡片；失败（或拿不到 message_id）则发新卡
                 if not (message_id and self._update_card_message(message_id, card)):
@@ -127,7 +135,8 @@ class LarkBot:
             logger.error("Failed to handle card event: %s", e, exc_info=True)
             return None
 
-    async def _run_card_action(self, action: str, sid: str, chat_id: str) -> tuple[str, str]:
+    async def _run_card_action(self, action: str, sid: str, chat_id: str,
+                               extra: dict | None = None) -> tuple[str, str]:
         """执行卡片动作，返回 (text, card_json)，二者最多一个非空"""
         if action in ("list", "refresh"):
             sessions = self._update_list_cache(chat_id)
@@ -138,7 +147,8 @@ class LarkBot:
             if not s:
                 return "❌ Session not found.", ""
             output, _ = await self._read_session_output(s)
-            return "", session_status_card(s, output)
+            decision, mode = await self._read_decision_and_mode(s)
+            return "", session_status_card(s, output, decision=decision, mode=mode)
 
         if action in ("confirm", "interrupt", "stop"):
             s = self.registry.get(sid) if sid else None
@@ -176,6 +186,60 @@ class LarkBot:
             # _cmd_enter 自己发交互卡片，这里只透传其文本提示
             return (await self._cmd_enter([sid], chat_id)) or "", ""
 
+        if action == "select-option":
+            # 决策卡选项直选：裸字符注入选项号（对话框把数字当按键消费，
+            # bracketed paste 会被对话框忽略——实测 2026-11-19）
+            s = self.registry.get(sid) if sid else None
+            if not s or not extra or not extra.get("o"):
+                return "❌ Session or option not found.", ""
+            ok = await self._dispatch_send(s, "keystroke", str(extra["o"]))
+            if not ok:
+                return f"❌ Select failed{self._send_fail_hint(s)}", ""
+            self.registry.update(sid, status="running")
+            return f"✅ Selected option {extra['o']} → `{sid[:8]}`", ""
+
+        if action == "send-key":
+            # 决策卡 y/n 等：裸字符注入（同上，对话框场景）
+            s = self.registry.get(sid) if sid else None
+            if not s or not extra or not extra.get("k"):
+                return "❌ Session or key not found.", ""
+            ok = await self._dispatch_send(s, "keystroke", str(extra["k"]))
+            if not ok:
+                return f"❌ Send failed{self._send_fail_hint(s)}", ""
+            self.registry.update(sid, status="running")
+            return f"✅ Sent `{extra['k']}` → `{sid[:8]}`", ""
+
+        if action == "esc":
+            # 关闭对话框 / 取消多选（原始 ESC 注入）
+            s = self.registry.get(sid) if sid else None
+            if not s:
+                return "❌ Session not found.", ""
+            ok = await self._dispatch_send(s, "raw_key", "esc")
+            if not ok:
+                return f"❌ Esc failed{self._send_fail_hint(s)}", ""
+            return f"🚫 Esc → `{sid[:8]}`", ""
+
+        if action == "cycle-mode":
+            # Claude Code Shift+Tab 循环权限模式（一步）
+            s = self.registry.get(sid) if sid else None
+            if not s:
+                return "❌ Session not found.", ""
+            ok = await self._dispatch_send(s, "raw_key", "shift_tab")
+            if not ok:
+                return f"❌ Mode switch failed{self._send_fail_hint(s)}", ""
+            # 稍等 TUI 重绘后读回当前模式
+            await asyncio.sleep(0.8)
+            _, mode = await self._read_decision_and_mode(s)
+            return f"🔁 Mode → {self._mode_label(mode)} (`{sid[:8]}`)", ""
+
+        if action == "set-mode":
+            # 直达目标模式：按 Shift+Tab 若干步（循环顺序内计算步数）
+            s = self.registry.get(sid) if sid else None
+            if not s or not extra or not extra.get("m"):
+                return "❌ Session or target mode not found.", ""
+            target = str(extra["m"])
+            return await self._set_mode(s, target), ""
+
         return f"Unknown card action: {action}", ""
 
     async def _enter_compose_mode(self, sid: str, chat_id: str) -> tuple[str, str]:
@@ -198,16 +262,19 @@ class LarkBot:
     def _parse_card_event(event: dict) -> dict:
         """防御式解析 card.action.trigger 事件（lark-cli 输出结构未定）
 
-        返回 {"action", "session_id", "chat_id", "message_id"}
+        返回 {"action", "session_id", "chat_id", "message_id", "extra"}
         """
-        action, sid = LarkBot._first_action_value(event)
+        action, sid, extra = LarkBot._first_action_value(event)
         chat_id, message_id = LarkBot._ids_from_card_event(event)
         return {"action": action, "session_id": sid,
-                "chat_id": chat_id, "message_id": message_id}
+                "chat_id": chat_id, "message_id": message_id, "extra": extra}
 
     @staticmethod
-    def _first_action_value(event: dict) -> tuple[str, str]:
-        """在事件的各层结构里找按钮 value（{"a": 动作, "s": 会话 ID}）"""
+    def _first_action_value(event: dict) -> tuple[str, str, dict]:
+        """在事件的各层结构里找按钮 value（{"a": 动作, "s": 会话 ID, ...附加参数}）
+
+        返回 (action, session_id, extra)；extra 是除 a/s 外的附加参数 dict。
+        """
         sources = [event]
         nested = event.get("event")
         if isinstance(nested, dict):
@@ -224,8 +291,9 @@ class LarkBot:
                     except json.JSONDecodeError:
                         continue
                 if isinstance(c, dict) and c.get("a"):
-                    return str(c["a"]), str(c.get("s", ""))
-        return "", ""
+                    extra = {k: v for k, v in c.items() if k not in ("a", "s")}
+                    return str(c["a"]), str(c.get("s", "")), extra
+        return "", "", {}
 
     @staticmethod
     def _ids_from_card_event(event: dict) -> tuple[str, str]:
@@ -388,6 +456,7 @@ class LarkBot:
             "confirm-all": self._cmd_confirm_all, "select": self._cmd_select,
             "interrupt": self._cmd_interrupt, "stop": self._cmd_stop,
             "help": self._cmd_help,
+            "mode": self._cmd_mode, "esc": self._cmd_esc,
             "enter": self._cmd_enter, "exit": self._cmd_exit,
             "new": self._cmd_new,
             "new-opencode": self._cmd_new_opencode,
@@ -481,8 +550,8 @@ class LarkBot:
                 else:
                     self.registry.update(session_id, status=status)
             elif stype == "terminal":
-                tags = s.get("tags", {}) or {}
-                tty = tags.get("tty", "") if isinstance(tags, dict) else ""
+                # registry.get 返回的 tags 是 JSON 字符串，session_tty 统一解析
+                tty = session_tty(s)
                 read_via_tty = False
                 if tty:
                     try:
@@ -518,7 +587,8 @@ class LarkBot:
         # Re-fetch to get updated status
         s = self.registry.get(session_id)
         idx = self._find_index(session_id, chat_id)
-        self._send_card_to_chat(chat_id, session_status_card(s, output, idx))
+        decision, mode = await self._read_decision_and_mode(s)
+        self._send_card_to_chat(chat_id, session_status_card(s, output, idx, decision=decision, mode=mode))
         return ""
 
     async def _cmd_pending(self, _args: list[str], chat_id: str) -> str:
@@ -788,12 +858,12 @@ class LarkBot:
         ide 会话不抢焦点读屏，返回空串。
         """
         if stype == "terminal":
-            tags = s.get("tags", {}) or {}
-            tty = tags.get("tty", "") if isinstance(tags, dict) else ""
+            # registry.get 返回的 tags 是 JSON 字符串，session_tty 统一解析
+            tty = session_tty(s)
             if not tty:
                 return ""
             try:
-                live_output, _ = self.ide_ctrl.read_terminal_by_tty(tty, 30)
+                live_output, _ = self.ide_ctrl.read_terminal_by_tty(tty, 40)
                 return live_output
             except Exception:
                 return ""
@@ -884,8 +954,9 @@ class LarkBot:
         s = self.registry.get(session_id)
         if not s:
             return "❌ Session no longer exists"
-        # select = 发送"选项号 + 回车"，三类会话语义一致（terminal 按 tty 定位 tab）
-        ok = await self._dispatch_send(s, "send", str(option))
+        # select = 裸字符注入选项号（对话框数字键即选中；bracketed paste
+        # 会被对话框忽略），三类会话语义一致（terminal 按 tty 定位 tab）
+        ok = await self._dispatch_send(s, "keystroke", str(option))
         if ok:
             self.registry.update(session_id, status="running")
             return f"✅ Selected option {option} → `{session_id[:8]}`"
@@ -908,6 +979,93 @@ class LarkBot:
             self.registry.update(session_id, status="running")
             return f"⚠️ Interrupted `{session_id[:8]}`"
         return "❌ Interrupt failed"
+
+    async def _cmd_mode(self, args: list[str], chat_id: str) -> str:
+        """查看或设置 Claude Code 权限模式
+
+        /mode <id>            查看当前模式
+        /mode <id> next       Shift+Tab 循环一步
+        /mode <id> plan       直达目标模式（auto/manual/accept-edits/plan）
+        """
+        if not args:
+            return ("Usage: `/mode <id|N>` 查看 · `/mode <id|N> next` 循环 · "
+                    "`/mode <id|N> (auto|manual|accept-edits|plan)` 直达")
+        session_id = await self._resolve_target(args[0], chat_id)
+        if not session_id:
+            return f"❌ Session not found: `{args[0]}`"
+        s = self.registry.get(session_id)
+        if not s:
+            return "❌ Session no longer exists"
+        if s.get("agent") != "claude":
+            return "❌ 仅 Claude Code 会话支持模式切换"
+        if s.get("session_type") == "ide":
+            return "❌ IDE 会话（焦点注入）不支持无头模式切换，请在终端里操作"
+        # 无参数：读当前模式
+        if len(args) < 2:
+            _, mode = await self._read_decision_and_mode(s)
+            return f"当前模式: {self._mode_label(mode)} (`{session_id[:8]}`)"
+        target = args[1].lower()
+        if target in ("next", "cycle"):
+            ok = await self._dispatch_send(s, "raw_key", "shift_tab")
+            if not ok:
+                return f"❌ Mode switch failed{self._send_fail_hint(s)}"
+            await asyncio.sleep(0.8)
+            _, mode = await self._read_decision_and_mode(s)
+            return f"🔁 Mode → {self._mode_label(mode)} (`{session_id[:8]}`)"
+        return await self._set_mode(s, target)
+
+    async def _set_mode(self, s: dict, target: str) -> str:
+        """把会话切到目标权限模式：按循环顺序算步数连按 Shift+Tab
+
+        每步之间读回实际模式（banner 校验），避免步数错位后盲按。
+        读不到 banner 时（对话框覆盖底栏）先 Esc 关掉对话框再读。
+        目标不可达（不在循环里）或连按 5 轮仍未命中时报错。
+        """
+        from decision_detect import MODE_CYCLE, steps_to_mode, KIND_NONE
+        sid = s["id"]
+        if target not in MODE_CYCLE:
+            return (f"❌ 未知模式 `{target}`。可选: {' / '.join(MODE_CYCLE)}")
+        for _ in range(5):
+            decision, current = await self._read_decision_and_mode(s)
+            # 对话框打开时底栏被覆盖、banner 不可读——先 Esc 关掉
+            # （只关对话框不影响执行中的任务）
+            if current == "" and decision.get("kind", KIND_NONE) != KIND_NONE:
+                await self._dispatch_send(s, "raw_key", "esc")
+                await asyncio.sleep(1.2)
+                decision, current = await self._read_decision_and_mode(s)
+            steps = steps_to_mode(current, target)
+            if steps == 0:
+                return f"✅ Mode = {self._mode_label(target)} (`{sid[:8]}`)"
+            for _i in range(steps):
+                ok = await self._dispatch_send(s, "raw_key", "shift_tab")
+                if not ok:
+                    return f"❌ Mode switch failed{self._send_fail_hint(s)}"
+                await asyncio.sleep(0.8)
+        return f"❌ 切换未收敛（目标 {self._mode_label(target)}），请 `/mode {sid[:8]}` 查看当前状态"
+
+    @staticmethod
+    def _mode_label(mode: str) -> str:
+        """模式名 → 展示文案（未知模式给 default 提示）"""
+        from decision_detect import MODE_LABELS
+        return MODE_LABELS.get(mode) or MODE_LABELS["default"]
+
+    async def _cmd_esc(self, args: list[str], chat_id: str) -> str:
+        """发送 Esc（关闭对话框 / 取消多选）"""
+        if args:
+            session_id = await self._resolve_target(args[0], chat_id)
+        else:
+            session_id = _session_context.get(chat_id, {}).get("selected")
+            if not session_id:
+                return "Usage: `/esc <id|N>` or `/esc` (last session)"
+        if not session_id:
+            return "❌ Session not found"
+        s = self.registry.get(session_id)
+        if not s:
+            return "❌ Session no longer exists"
+        ok = await self._dispatch_send(s, "raw_key", "esc")
+        if ok:
+            return f"🚫 Esc → `{session_id[:8]}`"
+        return f"❌ Esc failed{self._send_fail_hint(s)}"
 
     async def _cmd_stop(self, args: list[str], chat_id: str) -> str:
         if not args:
@@ -1065,7 +1223,7 @@ class LarkBot:
             cs = read_claude_session_state(pid) if pid else None
             if cs:
                 sid = cs.get("sessionId", "")
-                text, _ = read_last_assistant_message(s.get("cwd", ""), sid)
+                text, _ = read_last_assistant_message(s.get("cwd", ""), sid, 5000)
                 if text:
                     return text, len(text.splitlines())
             return self.ide_ctrl.read_output(s.get("app_name", ""), 15)
@@ -1073,7 +1231,7 @@ class LarkBot:
             # 按 TTY 精确读取该会话自己的 Terminal tab（非侵入、不抢焦点）。
             # 不能用 read_terminal_full_output —— 它读的是最前台窗口，所有会话会串台
             tty = session_tty(s)
-            output, lc = self.ide_ctrl.read_terminal_by_tty(tty, 50) if tty else ("", 0)
+            output, lc = self.ide_ctrl.read_terminal_by_tty(tty, 120) if tty else ("", 0)
             if output:
                 # 过滤分隔线/提示符行，只保留有意义的内容
                 lines = [l for l in output.splitlines()
@@ -1081,13 +1239,31 @@ class LarkBot:
                          and not l.strip().startswith("❯")
                          and not l.strip().startswith("  ⏵")]
                 if lines:
-                    filtered = "\n".join(lines[-30:])
+                    filtered = "\n".join(lines[-60:])
                     return filtered, len(lines)
                 return output, lc
             # 兜底：TTY 读不到（tab 已关闭等）时退回日志文件
             output, lc = await self.screen_mgr.read_output(session_id, 15)
             return output, lc
         return await self.screen_mgr.read_output(session_id, 15)
+
+    async def _read_decision_and_mode(self, s: dict) -> tuple[dict, str]:
+        """读取会话终端尾部，识别当前决策对话框与权限模式
+
+        Returns:
+            (decision, mode)：decision 见 decision_detect.detect_decision，
+            mode 为权限模式名（plan / accept-edits / bypass-permissions，
+            未知为空串）
+        """
+        from decision_detect import detect_decision, detect_mode, KIND_NONE
+        stype = s.get("session_type", "screen")
+        agent = s.get("agent", "claude")
+        visible = await self._read_session_visible(s, stype, agent)
+        if not visible:
+            return {"kind": KIND_NONE, "title": "", "options": [], "hint": ""}, ""
+        decision = detect_decision(visible, agent=agent)
+        mode = detect_mode(visible) if agent == "claude" else ""
+        return decision, mode
 
     async def _confirm_from_bot(self, s: dict) -> bool:
         session_id = s["id"]
@@ -1146,7 +1322,7 @@ class LarkBot:
         try:
             content = json.dumps({"text": text}, ensure_ascii=False)
             proc = await asyncio.create_subprocess_exec(
-                "lark-cli", "im", "send", "--chat-id", chat_id, "--msg-type", "text",
+                "lark-cli", "im", "+messages-send", "--chat-id", chat_id, "--msg-type", "text",
                 "--content", content, "--as", "bot",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )

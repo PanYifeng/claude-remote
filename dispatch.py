@@ -30,8 +30,9 @@ async def send_to_session(ide_ctrl, screen_mgr, session: dict, action: str, text
         ide_ctrl: IDEControl 实例
         screen_mgr: ScreenManager 实例
         session: 会话记录（registry.get/list 返回的 dict）
-        action: "send"（文本+回车）/ "enter" / "ctrl_c"
-        text: action=="send" 时的文本
+        action: "send"（文本+回车）/ "enter" / "ctrl_c" / "raw_key"
+        text: action=="send" 时的文本；action=="raw_key" 时的按键名
+              （esc / shift_tab / up / down）
 
     Returns:
         是否发送成功
@@ -49,6 +50,11 @@ async def send_to_session(ide_ctrl, screen_mgr, session: dict, action: str, text
                 return await asyncio.to_thread(ide_ctrl.send_enter_to_tty, tty)
             if action == "ctrl_c":
                 return await asyncio.to_thread(ide_ctrl.send_ctrl_c_to_tty, tty)
+            if action == "raw_key":
+                return await asyncio.to_thread(ide_ctrl.send_raw_key_to_tty, tty, text)
+            if action == "keystroke":
+                # 裸字符按键（对话框数字/y/n）——bracketed paste 会被对话框忽略
+                return await asyncio.to_thread(ide_ctrl.send_keystroke_to_tty, tty, text)
             return False
         app = session.get("app_name", "") or "Terminal"
     elif stype == "ide":
@@ -61,6 +67,11 @@ async def send_to_session(ide_ctrl, screen_mgr, session: dict, action: str, text
             return await screen_mgr.send_enter(sid)
         if action == "ctrl_c":
             return await screen_mgr.send_ctrl_c(sid)
+        if action == "raw_key":
+            return await screen_mgr.send_raw_key(sid, text)
+        if action == "keystroke":
+            # tmux：裸字符按键即 send-keys 文本（无 bracketed paste），对话框可消费
+            return await screen_mgr.send_text(sid, text)
         return False
 
     # ide 或无 tty 的 terminal：发到 app

@@ -628,6 +628,42 @@ class IDEControl:
         """向 tty 对应的 Terminal tab 发送回车（do script 空串）"""
         return self._do_script_to_tty(tty, [""])
 
+    # 原始按键的转义序列（do script 注入，TUI 直达）
+    _RAW_KEYS = {
+        "esc": '(character id 27)',            # ESC：关闭对话框 / 退出多选
+        "shift_tab": '(character id 27) & "[Z"',   # Shift+Tab：切换权限模式
+        "up": '(character id 27) & "[A"',      # 上方向键
+        "down": '(character id 27) & "[B"',    # 下方向键
+    }
+
+    def send_raw_key_to_tty(self, tty: str, key: str) -> bool:
+        """向 tty 对应的 Terminal tab 注入原始按键（ESC / Shift+Tab / 方向键）
+
+        do script 会给每条命令补一个回车（实测 ESC 后跟 0x0a），但 TUI
+        （Claude Code 等）读取的是转义序列本身，行尾 CR 不影响——
+        ESC+CR 等价于按 ESC 后立刻按回车，对模式切换/关闭对话框场景
+        无副作用；实测注入 ESC[Z 后 TUI 正确切换权限模式。
+        """
+        expr = self._RAW_KEYS.get(key)
+        if not expr:
+            logger.warning("send_raw_key_to_tty: unknown key %r", key)
+            return False
+        return self._run_in_tty_tab(tty, [f"do script {expr} in theTab"])
+
+    def send_keystroke_to_tty(self, tty: str, text: str) -> bool:
+        """向 tty 注入裸字符按键（非 bracketed paste），用于 TUI 对话框
+
+        对话框（审批/选择）把数字键当按键消费：bracketed paste 的内容
+        会被对话框忽略（实测 2026-11-19：粘贴 '2' 无效果），必须以裸
+        字符注入。do script 自带的行尾 CR 无害——数字键选中即提交并
+        关闭对话框，CR 到达时对话框已关（空回车被 TUI 输入框忽略）。
+        仅用于短按键串（数字/y/n）；长文本仍走 bracketed paste。
+        """
+        if not text:
+            return self.send_enter_to_tty(tty)
+        stmts = [f'do script "{self._applescript_escape(text)}" in theTab']
+        return self._run_in_tty_tab(tty, stmts)
+
     def send_ctrl_c_to_tty(self, tty: str) -> bool:
         """向 tty 的前台进程组发送 SIGINT（等价键盘 Ctrl+C，无头）
 

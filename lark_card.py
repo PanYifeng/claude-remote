@@ -6,6 +6,7 @@ Bilingual (EN/CN) labels.
 """
 
 import json
+import re
 
 
 def session_list_card(sessions: list[dict]) -> str:
@@ -88,7 +89,8 @@ def session_list_card(sessions: list[dict]) -> str:
     return json.dumps(card, ensure_ascii=False)
 
 
-def session_status_card(s: dict, output: str = "", idx: int = -1) -> str:
+def session_status_card(s: dict, output: str = "", idx: int = -1,
+                        decision: dict | None = None, mode: str = "") -> str:
     label = _session_label(s)
     status = s.get("status", "unknown")
     cwd = s.get("cwd", "")
@@ -100,15 +102,26 @@ def session_status_card(s: dict, output: str = "", idx: int = -1) -> str:
 
     elements = [_md(f"**Status / 状态:** {status_text}\n**Dir / 目录:** `{cwd}`")]
 
+    if mode:
+        from decision_detect import MODE_LABELS
+        mode_text = MODE_LABELS.get(mode, mode)
+        elements.append(_md(f"**Mode / 模式:** {mode_text}"))
+
     if stype == "ide" and status == "running":
         elements.append(_md("💡 IDE 会话无法自动检测状态。再次发送 `/status` 可读取终端内容获取精确状态。"))
 
     if output:
-        # 直接取末尾内容展示。等待提示（"Do you want to proceed?"、选项列表、
-        # "Esc to cancel"）通常就在末尾几行，不能像之前那样砍掉最后 4 行。
-        display = output[-500:]
+        # 展示末轮完整内容：截断到 5000 字符（约等于一整轮 assistant 输出），
+        # 优先保尾部——等待提示/最新结论总在末尾
+        display = output[-_MAX_OUTPUT_CHARS:]
+        if len(output) > _MAX_OUTPUT_CHARS:
+            display = "…（前文截断）\n" + display
         if display.strip():
             elements.append(_md(f"**Output / 输出:**\n```\n{display}\n```"))
+
+    # 决策对话框：按类型给出针对性按钮（选项直选 / y-n / 确认）
+    if decision and decision.get("kind") != "none":
+        elements.extend(_decision_elements(decision, s["id"]))
 
     elements.append({"tag": "hr"})
     # 快捷操作按钮：点击直接执行，无需手动复制命令（value 用完整会话 ID）
@@ -122,6 +135,21 @@ def session_status_card(s: dict, output: str = "", idx: int = -1) -> str:
         _btn("💬 交互", "enter", s["id"]),
         _btn("🔄 刷新", "status", s["id"]),
     ]))
+    # 模式切换（Claude Code：Shift+Tab 循环）+ Esc 关闭对话框
+    if stype != "ide" and s.get("agent", "claude") == "claude":
+        # 直达四个循环模式（当前模式高亮为 primary，其余 default）
+        from decision_detect import MODE_CYCLE, MODE_LABELS
+        mode_btns = [
+            _btn(MODE_LABELS[m], "set-mode", s["id"],
+                 "primary" if m == mode else "default", {"m": m})
+            for m in MODE_CYCLE
+        ]
+        elements.append(_btn_row(mode_btns[:2]))
+        elements.append(_btn_row(mode_btns[2:]))
+        elements.append(_btn_row([
+            _btn("🔁 循环一步", "cycle-mode", s["id"]),
+            _btn("🚫 Esc", "esc", s["id"]),
+        ]))
     # 保留一条可复制的 /send 命令行（compose 模式之外的手动用法）
     elements.append(_cmd(f"/send {sid} "))
 
@@ -132,6 +160,125 @@ def session_status_card(s: dict, output: str = "", idx: int = -1) -> str:
         "elements": elements,
     }
     return json.dumps(card, ensure_ascii=False)
+
+
+# 状态卡输出最多展示的字符数（末轮完整会话优先）
+_MAX_OUTPUT_CHARS = 5000
+
+
+def _decision_elements(decision: dict, sid: str) -> list[dict]:
+    """把识别出的决策对话框渲染成针对性按钮组
+
+    - options/multi：选项全文逐行列在正文（不截断），按钮只放序号短标签
+      ——真实选项文本常达 60-70 字符（"Yes, and always allow access to
+      /tmp..."），塞进按钮 label 会被砍成碎片，全文放正文可完整阅读
+    - yn：Yes / No 按钮（发送 y / n）
+    - confirm：单个确认按钮（Enter）
+    """
+    kind = decision.get("kind", "none")
+    title = decision.get("title", "")
+    hint = decision.get("hint", "")
+    rows: list[dict] = [{"tag": "hr"}]
+    if title:
+        rows.append(_md(f"🎯 **{title}"))
+    if hint:
+        rows.append(_md(f"_{hint}_"))
+
+    if kind in ("options", "multi") and decision.get("options"):
+        # 选项全文逐行展示（正文行不截断，长选项可完整阅读）
+        for num, text in decision["options"]:
+            rows.append(_md(f"**{num}.** {text}"))
+        # 按钮短标签必须互相可区分：同关键词的选项（1 Yes / 2 Yes / 3 Yes）
+        # 按钮上补差异词（always / auto mode...），仍冲突则只放序号
+        shorts = _distinct_shorts(decision["options"])
+        for i in range(0, len(opts := decision["options"]), 4):
+            chunk = opts[i:i + 4]
+            rows.append(_btn_row([
+                _btn(f"{num} {shorts[num]}", "select-option", sid, "primary", {"o": num})
+                for num, _text in chunk
+            ]))
+    elif kind == "yn":
+        rows.append(_btn_row([
+            _btn("✅ Yes", "send-key", sid, "primary", {"k": "y"}),
+            _btn("❌ No", "send-key", sid, "default", {"k": "n"}),
+        ]))
+    elif kind == "confirm":
+        rows.append(_btn_row([
+            _btn("✅ 确认", "confirm", sid, "primary"),
+            _btn("🚫 取消", "esc", sid),
+        ]))
+    return rows
+
+
+def _option_short(text: str) -> str:
+    """选项文本 → 按钮短标签（≤6 字符）
+
+    优先取有辨识度的词：Yes/No/Always/Reject 等关键词直接用；
+    否则截前 6 个字符。全文在正文行展示，按钮只需可辨认。
+    """
+    lower = text.lower()
+    for kw in ("yes", "no", "always", "reject", "allow", "deny", "never", "stop", "skip"):
+        if kw in lower:
+            return kw.capitalize()
+    # 无关键词：截前 6 个字符（中文按字符数同样适用）
+    return text[:6] if len(text) <= 6 else text[:5] + "…"
+
+
+def _distinct_shorts(options: list[tuple[str, str]]) -> dict[str, str]:
+    """给每个选项生成互相可区分的按钮短标签
+
+    规则（逐级加强直到无冲突）：
+    1. 基础短标签（关键词/前缀）
+    2. 冲突时从选项全文里挖差异词拼在基础标签后，只拼到能区分为止
+       （每轮比较一次，已无冲突即停，避免标签越拼越长）
+    3. 仍冲突则放弃文字区分，按钮只放序号（正文行有全文可对照）
+    """
+    shorts = {num: _option_short(text) for num, text in options}
+    words = {num: _distinct_words(text) for num, text in options}
+
+    def _has_conflict() -> bool:
+        seen = set()
+        for short in shorts.values():
+            if short in seen:
+                return True
+            seen.add(short)
+        return False
+
+    # 逐轮拼差异词：每轮每个冲突选项追加下一个差异词，无冲突即停
+    for _round in range(4):
+        if not _has_conflict():
+            break
+        by_short: dict[str, list[str]] = {}
+        for num, short in shorts.items():
+            by_short.setdefault(short, []).append(num)
+        for _short, nums in by_short.items():
+            if len(nums) < 2:
+                continue
+            for num in nums:
+                extra = words.get(num, [])
+                if _round < len(extra):
+                    shorts[num] = f"{shorts[num]}·{extra[_round]}"
+    # 仍冲突：退化为空标签（按钮只显示序号）
+    if _has_conflict():
+        seen: dict[str, str] = {}
+        for num, short in shorts.items():
+            if short in seen.values():
+                shorts[num] = ""
+            else:
+                seen[num] = short
+    return shorts
+
+
+def _distinct_words(text: str) -> list[str]:
+    """从选项文本提取有实义的差异词（去掉所有选项共有的常见词）"""
+    # 常见虚词/共有词，不具区分度
+    _STOP = {"yes", "no", "and", "the", "a", "an", "to", "for", "this",
+             "that", "in", "on", "of", "with", "you", "it", "is", "are"}
+    words = []
+    for w in re.findall(r"[a-zA-Z]{3,}", text.lower()):
+        if w not in _STOP and w not in words:
+            words.append(w)
+    return words[:4]
 
 
 def pending_card(sessions: list[dict]) -> str:
@@ -180,14 +327,18 @@ def _cmd(cmd: str) -> dict:
     return {"tag": "div", "text": {"tag": "lark_md", "content": cmd}}
 
 
-def _btn(label: str, action: str, session_id: str = "", btn_type: str = "default") -> dict:
+def _btn(label: str, action: str, session_id: str = "", btn_type: str = "default",
+         extra: dict | None = None) -> dict:
     """交互卡片按钮：点击经 card.action.trigger 事件回调到 bot
 
-    value 里的 a=动作名、s=会话 ID，与 lark_bot.handle_card_event 约定一致。
+    value 里的 a=动作名、s=会话 ID，与 lark_bot.handle_card_event 约定一致；
+    extra 里的附加参数（如 o=选项号、k=按键文本）原样并入 value。
     """
     value: dict = {"a": action}
     if session_id:
         value["s"] = session_id
+    if extra:
+        value.update(extra)
     return {
         "tag": "button",
         "text": {"tag": "plain_text", "content": label},
