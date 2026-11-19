@@ -243,6 +243,18 @@ class LarkBot:
             target = str(extra["m"])
             return await self._set_mode(s, target), ""
 
+        if action == "set-model":
+            # 状态卡模型按钮：TUI '/model <name>' 直接切换
+            s = self.registry.get(sid) if sid else None
+            if not s or not extra or not extra.get("m"):
+                return "❌ Session or target model not found.", ""
+            model = str(extra["m"])
+            ok = await self._dispatch_send(s, "send", f"/model {model}")
+            if not ok:
+                return f"❌ Set model failed{self._send_fail_hint(s)}", ""
+            return (f"✅ Set model → `{model}` (`{sid[:8]}`)\n"
+                    f"⚠️ TUI 会把它保存为所有新会话的默认模型"), ""
+
         return f"Unknown card action: {action}", ""
 
     async def _enter_compose_mode(self, sid: str, chat_id: str) -> tuple[str, str]:

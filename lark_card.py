@@ -154,6 +154,17 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
             _btn("🔁 循环一步", "cycle-mode", s["id"]),
             _btn("🚫 Esc", "esc", s["id"]),
         ]))
+    # 模型切换：精选实测可用模型按钮（当前模型高亮）
+    if s.get("agent", "claude") == "claude":
+        from model_control import collect_known_models
+        model_btns = []
+        for m in collect_known_models([])[:5]:
+            short = m.split("/")[-1]
+            model_btns.append(_btn(short, "set-model", s["id"],
+                                   "primary" if m == model else "default", {"m": m}))
+        if model_btns:
+            elements.append(_btn_row(model_btns[:3]))
+            elements.append(_btn_row(model_btns[3:]))
     # 保留一条可复制的 /send 命令行（compose 模式之外的手动用法）
     elements.append(_cmd(f"/send {sid} "))
 

@@ -56,11 +56,22 @@ def read_session_model(cwd: str, session_id: str) -> str:
     return ""
 
 
+# 实测可用模型（2026-11-19 网关探测：Anthropic 协议全部 OK）。
+# 旧的 Vendor3/glm-5.1 已 404 下线；Vendor2/GLM-5.1 走 Anthropic 协议 400。
+_CURATED_MODELS = [
+    "GLM-5.3-flash",
+    "DeepSeek-V4.1-Flash-1017",
+    "Vendor3/glm-5",
+    "Vendor3/MiniMax-M2.5",
+    "Vendor2/Claude-4.8-opus",
+]
+
+
 def collect_known_models(active_sessions: list[dict]) -> list[str]:
     """收集候选模型列表（去重、保序）
 
-    来源：settings.json env 的模型配置 + 各活跃会话当前实际在用的模型。
-    settings 里的排前面（用户显式配置的优先展示）。
+    来源：精选实测可用列表 + settings.json env 的模型配置 + 各活跃会话
+    当前实际在用的模型。精选列表排最前（真实可用、直接可选）。
 
     Args:
         active_sessions: 活跃会话列表（registry.list() 的返回值）
@@ -68,7 +79,7 @@ def collect_known_models(active_sessions: list[dict]) -> list[str]:
     Returns:
         模型名列表，空则返回默认建议
     """
-    models: list[str] = []
+    models: list[str] = list(_CURATED_MODELS)
     # settings.json env 里的模型配置
     for env_key in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
                     "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
@@ -90,13 +101,11 @@ def collect_known_models(active_sessions: list[dict]) -> list[str]:
         m = read_session_model(s.get("cwd", ""), state.get("sessionId", ""))
         if m and m not in models:
             models.append(m)
-    # 大小写归一化去重（GLM-5.3-Flash 与 GLM-5.3-flash 是同一模型）
+    # 大小写归一化去重（网关实测不区分大小写；GLM-5.3-Flash 与 GLM-5.3-flash 同模型）
     seen: dict[str, str] = {}
     for m in models:
         seen.setdefault(m.lower(), m)
     models = list(seen.values())
-    if not models:
-        models = ["GLM-5.3-flash"]
     return models
 
 
