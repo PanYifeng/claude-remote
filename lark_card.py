@@ -90,7 +90,8 @@ def session_list_card(sessions: list[dict]) -> str:
 
 
 def session_status_card(s: dict, output: str = "", idx: int = -1,
-                        decision: dict | None = None, mode: str = "") -> str:
+                        decision: dict | None = None, mode: str = "",
+                        model: str = "") -> str:
     label = _session_label(s)
     status = s.get("status", "unknown")
     cwd = s.get("cwd", "")
@@ -101,6 +102,9 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
     sid = s["id"][:8]
 
     elements = [_md(f"**Status / 状态:** {status_text}\n**Dir / 目录:** `{cwd}`")]
+
+    if model:
+        elements.append(_md(f"**Model / 模型:** `{model}`"))
 
     if mode:
         from decision_detect import MODE_LABELS

@@ -51,6 +51,8 @@ COMMAND_HELP = """
 /select <id|N> <n>            — Select option N
 /interrupt [id|N]             — Send Ctrl+C. No arg = last session
 /mode <id|N> [mode]           — Show / set permission mode (auto|manual|accept-edits|plan|next)
+/setmodel <id|N> [model]       — Show or switch the session's model (no arg = list candidates)
+/models                        — List all known models across sessions
 /esc [id|N]                   — Send Esc (close dialog / cancel selection)
 /stop <id|N>                  — Stop session
 /daemon (stop|restart|status) — Control daemon service
@@ -148,7 +150,8 @@ class LarkBot:
                 return "❌ Session not found.", ""
             output, _ = await self._read_session_output(s)
             decision, mode = await self._read_decision_and_mode(s)
-            return "", session_status_card(s, output, decision=decision, mode=mode)
+            model = self._read_model(s) if s.get("agent", "claude") == "claude" else ""
+            return "", session_status_card(s, output, decision=decision, mode=mode, model=model)
 
         if action in ("confirm", "interrupt", "stop"):
             s = self.registry.get(sid) if sid else None
@@ -457,6 +460,7 @@ class LarkBot:
             "interrupt": self._cmd_interrupt, "stop": self._cmd_stop,
             "help": self._cmd_help,
             "mode": self._cmd_mode, "esc": self._cmd_esc,
+            "setmodel": self._cmd_setmodel, "models": self._cmd_models,
             "enter": self._cmd_enter, "exit": self._cmd_exit,
             "new": self._cmd_new,
             "new-opencode": self._cmd_new_opencode,
@@ -588,7 +592,8 @@ class LarkBot:
         s = self.registry.get(session_id)
         idx = self._find_index(session_id, chat_id)
         decision, mode = await self._read_decision_and_mode(s)
-        self._send_card_to_chat(chat_id, session_status_card(s, output, idx, decision=decision, mode=mode))
+        model = self._read_model(s) if s.get("agent", "claude") == "claude" else ""
+        self._send_card_to_chat(chat_id, session_status_card(s, output, idx, decision=decision, mode=mode, model=model))
         return ""
 
     async def _cmd_pending(self, _args: list[str], chat_id: str) -> str:
@@ -1066,6 +1071,58 @@ class LarkBot:
         if ok:
             return f"🚫 Esc → `{session_id[:8]}`"
         return f"❌ Esc failed{self._send_fail_hint(s)}"
+
+    async def _cmd_setmodel(self, args: list[str], chat_id: str) -> str:
+        """查看或切换会话模型
+
+        /setmodel <id>          查看当前模型 + 候选列表
+        /setmodel <id> <model>  切换（TUI '/model <name>'，切换即保存为默认）
+        """
+        if not args:
+            return "Usage: `/setmodel <id|N>` 查看 · `/setmodel <id|N> <model>` 切换"
+        session_id = await self._resolve_target(args[0], chat_id)
+        if not session_id:
+            return f"❌ Session not found: `{args[0]}`"
+        s = self.registry.get(session_id)
+        if not s:
+            return "❌ Session no longer exists"
+        if s.get("agent") != "claude":
+            return "❌ 仅 Claude Code 会话支持模型切换"
+        current = self._read_model(s)
+        if len(args) < 2:
+            from model_control import collect_known_models
+            candidates = collect_known_models(self.registry.list())
+            lines = [f"当前模型: `{current or '未知'}` (`{session_id[:8]}`)", "", "候选模型:"]
+            lines += [f"  • `{m}`" + (" ← 当前" if m == current else "") for m in candidates]
+            lines.append(f"\n切换: `/setmodel {session_id[:8]} <model>`")
+            return "\n".join(lines)
+        # 切换：TUI 斜杠命令直接生效（实测无需对话框交互）
+        model = " ".join(args[1:])
+        ok = await self._dispatch_send(s, "send", f"/model {model}")
+        if not ok:
+            return f"❌ Set model failed{self._send_fail_hint(s)}"
+        return (f"✅ Set model → `{model}` (`{session_id[:8]}`)\n"
+                f"⚠️ 注意：TUI 会把它保存为所有新会话的默认模型")
+
+    async def _cmd_models(self, _args: list[str], chat_id: str) -> str:
+        """列出所有已知候选模型"""
+        from model_control import collect_known_models
+        candidates = collect_known_models(self.registry.list())
+        return "已知模型:\n" + "\n".join(f"  • `{m}`" for m in candidates)
+
+    def _read_model(self, s: dict) -> str:
+        """读取会话当前模型（transcript 最后一条 assistant 的 model）"""
+        from model_control import read_session_model
+        pid = s.get("pid", 0)
+        if not pid:
+            return ""
+        try:
+            state_fp = os.path.expanduser(f"~/.claude/sessions/{pid}.json")
+            with open(state_fp, encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            return ""
+        return read_session_model(s.get("cwd", ""), state.get("sessionId", ""))
 
     async def _cmd_stop(self, args: list[str], chat_id: str) -> str:
         if not args:
