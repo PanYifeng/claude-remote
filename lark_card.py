@@ -90,7 +90,8 @@ def session_list_card(sessions: list[dict]) -> str:
 
 
 def session_status_card(s: dict, output: str = "", idx: int = -1,
-                        decision: dict | None = None, mode: str = "") -> str:
+                        decision: dict | None = None, mode: str = "",
+                        model: str = "", model_groups: dict | None = None) -> str:
     label = _session_label(s)
     status = s.get("status", "unknown")
     cwd = s.get("cwd", "")
@@ -101,6 +102,9 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
     sid = s["id"][:8]
 
     elements = [_md(f"**Status / 状态:** {status_text}\n**Dir / 目录:** `{cwd}`")]
+
+    if model:
+        elements.append(_md(f"**Model / 模型:** `{model}`"))
 
     if mode:
         from decision_detect import MODE_LABELS
@@ -124,7 +128,8 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
         elements.extend(_decision_elements(decision, s["id"]))
 
     elements.append({"tag": "hr"})
-    # 快捷操作按钮：点击直接执行，无需手动复制命令（value 用完整会话 ID）
+    # ── 会话操作 ─────────────────────────────
+    elements.append(_md("**操作**"))
     elements.append(_btn_row([
         _btn("✅ 确认", "confirm", s["id"], "primary"),
         _btn("✋ 中断", "interrupt", s["id"]),
@@ -135,8 +140,11 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
         _btn("💬 交互", "enter", s["id"]),
         _btn("🔄 刷新", "status", s["id"]),
     ]))
-    # 模式切换（Claude Code：Shift+Tab 循环）+ Esc 关闭对话框
+
+    # ── 权限模式（Claude Code：Shift+Tab 循环）+ Esc ──
     if stype != "ide" and s.get("agent", "claude") == "claude":
+        elements.append({"tag": "hr"})
+        elements.append(_md("**权限模式**"))
         # 直达四个循环模式（当前模式高亮为 primary，其余 default）
         from decision_detect import MODE_CYCLE, MODE_LABELS
         mode_btns = [
@@ -150,6 +158,37 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
             _btn("🔁 循环一步", "cycle-mode", s["id"]),
             _btn("🚫 Esc", "esc", s["id"]),
         ]))
+
+    # ── 模型切换 ────────────────────────────
+    if s.get("agent", "claude") == "claude":
+        elements.append({"tag": "hr"})
+        elements.append(_md("**模型**"))
+        # 分组由调用方预取传入（含网络 IO，不在卡片构建里拉）；
+        # 未传时回退内置精选
+        if model_groups is None:
+            from model_control import _CURATED_MODEL_GROUPS as model_groups
+        # 卡片只展示前 5 个家族（避免过长），完整列表走 /models 命令
+        shown_groups = dict(list(model_groups.items())[:5])
+        if len(model_groups) > 5:
+            shown_groups.setdefault("…", [])
+        # 按分组友好展示，当前模型高亮
+        for group_name, group_models in shown_groups.items():
+            btns = []
+            for m in group_models:
+                short = m.split("/")[-1]
+                btns.append(_btn(short, "set-model", s["id"],
+                                 "primary" if m == model else "default", {"m": m}))
+            if btns:
+                elements.append(_md(f"**{group_name}**"))
+                elements.append(_btn_row(btns[:3]))
+                if len(btns) > 3:
+                    elements.append(_btn_row(btns[3:]))
+        # 手动输入与完整列表入口
+        elements.append(_md(
+            f"✏️ 其他模型: `/setmodel {sid} <model>` 手动输入"
+            f"（不区分大小写）· `/models` 查看全部"))
+
+    elements.append({"tag": "hr"})
     # 保留一条可复制的 /send 命令行（compose 模式之外的手动用法）
     elements.append(_cmd(f"/send {sid} "))
 
