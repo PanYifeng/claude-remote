@@ -6,7 +6,56 @@ Bilingual (EN/CN) labels.
 """
 
 import json
+import os
 import re
+
+
+def session_name(s: dict) -> str:
+    """读取会话的显示名（Claude Code 自动命名，如 patent-chunks-vector-recall）
+
+    来源是 per-process 状态文件 ~/.claude/sessions/<pid>.json 的 name 字段
+    （nameSource=auto 时由 Claude Code 按任务内容生成），比 类型—目录
+    更能区分同项目的多个会话。opencode / 无状态文件时返回空串。
+
+    Args:
+        s: session 记录
+
+    Returns:
+        显示名；无则空串
+    """
+    if s.get("agent", "claude") != "claude":
+        return ""
+    pid = s.get("pid", 0)
+    if not pid:
+        return ""
+    fp = os.path.join(os.path.expanduser("~"), ".claude", "sessions", f"{pid}.json")
+    try:
+        with open(fp, encoding="utf-8") as f:
+            name = json.load(f).get("name", "")
+        return name.strip() if isinstance(name, str) else ""
+    except Exception:
+        return ""
+
+
+def _session_headline(s: dict) -> str:
+    """会话条目标题行：有自动命名时用名字，否则用 类型—目录
+
+    名字一行过长时截断（卡片窄屏），完整信息在详情卡。
+    """
+    name = session_name(s)
+    label = _session_label(s)
+    if not name:
+        return label
+    if len(name) > 28:
+        name = name[:27] + "…"
+    return f"{_session_icon(s)} **{name}**"
+
+
+def _session_icon(s: dict) -> str:
+    """会话类型图标（🟦 OpenCode / 🔌 IDE / 💻 Terminal）"""
+    if s.get("agent", "claude") == "opencode":
+        return "🟦"
+    return "🔌" if s.get("session_type") == "ide" else "💻"
 
 
 def session_list_card(sessions: list[dict]) -> str:
@@ -27,9 +76,8 @@ def session_list_card(sessions: list[dict]) -> str:
     if waiting:
         rows.append(_md(f"🟡 **Waiting / 待确认 ({len(waiting)})**"))
         for s in waiting:
-            sid = s["id"][:8]
-            label = _session_label(s)
-            rows.append(_md(f"🟡 **{sid}** {label}"))
+            rows.append(_md(_session_headline(s)))
+            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s)}"))
             rows.append(_btn_row([
                 _btn("✅ 确认", "confirm", s["id"], "primary"),
                 _btn("📊 详情", "status", s["id"]),
@@ -39,25 +87,22 @@ def session_list_card(sessions: list[dict]) -> str:
     if executing:
         rows.append(_md(f"🔵 **Executing / 执行中 ({len(executing)})**"))
         for s in executing:
-            sid = s["id"][:8]
-            label = _session_label(s)
-            rows.append(_md(f"🔵 **{sid}** {label}"))
+            rows.append(_md(_session_headline(s)))
+            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s)}"))
             rows.append(_btn_row([_btn("📊 详情", "status", s["id"])]))
 
     if idle:
         rows.append(_md(f"⏸️ **Idle / 空闲 ({len(idle)})**"))
         for s in idle:
-            sid = s["id"][:8]
-            label = _session_label(s)
-            rows.append(_md(f"⏸️ **{sid}** {label}"))
+            rows.append(_md(_session_headline(s)))
+            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s)}"))
             rows.append(_btn_row([_btn("📊 详情", "status", s["id"])]))
 
     if active_others:
         rows.append(_md(f"🟢 **Active / 活动 ({len(active_others)})**"))
         for s in active_others:
-            sid = s["id"][:8]
-            label = _session_label(s)
-            rows.append(_md(f"🟢 **{sid}** {label}"))
+            rows.append(_md(_session_headline(s)))
+            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s)}"))
             rows.append(_btn_row([_btn("📊 详情", "status", s["id"])]))
 
     # 提示：IDE 类型 session 需要 /status 查看精确状态
@@ -102,6 +147,12 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
     sid = s["id"][:8]
 
     elements = [_md(f"**Status / 状态:** {status_text}\n**Dir / 目录:** `{cwd}`")]
+
+    # 会话名（Claude Code 自动命名）放在最前面，方便一眼确认是哪个任务
+    name = session_name(s)
+    if name:
+        elements.insert(0, _md(f"**Name / 名称:** {name}"))
+
 
     if model:
         elements.append(_md(f"**Model / 模型:** `{model}`"))
@@ -195,7 +246,7 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
 
     card = {
         "config": {"wide_screen_mode": False},
-        "header": {"title": {"tag": "lark_md", "content": f"📊 [{sid}] {label}"}},
+        "header": {"title": {"tag": "lark_md", "content": f"📊 [{sid}] {name or label}"}},
         "elements": elements,
     }
     return json.dumps(card, ensure_ascii=False)
@@ -325,8 +376,8 @@ def pending_card(sessions: list[dict]) -> str:
         return done_card("✅ No sessions waiting for input. / 无待确认会话")
     rows = []
     for i, s in enumerate(sessions, 1):
-        label = _session_label(s)
-        rows.append(_md(f"🟡 **{label}**"))
+        rows.append(_md(_session_headline(s)))
+        rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s)}"))
         rows.append(_btn_row([
             _btn("✅ 确认", "confirm", s["id"], "primary"),
             _btn("📊 详情", "status", s["id"]),
