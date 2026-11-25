@@ -77,7 +77,7 @@ def session_list_card(sessions: list[dict]) -> str:
         rows.append(_md(f"🟡 **Waiting / 待确认 ({len(waiting)})**"))
         for s in waiting:
             rows.append(_md(_session_headline(s)))
-            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s)}"))
+            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s, with_icon=False)}"))
             rows.append(_btn_row([
                 _btn("✅ 确认", "confirm", s["id"], "primary"),
                 _btn("📊 详情", "status", s["id"]),
@@ -88,21 +88,21 @@ def session_list_card(sessions: list[dict]) -> str:
         rows.append(_md(f"🔵 **Executing / 执行中 ({len(executing)})**"))
         for s in executing:
             rows.append(_md(_session_headline(s)))
-            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s)}"))
+            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s, with_icon=False)}"))
             rows.append(_btn_row([_btn("📊 详情", "status", s["id"])]))
 
     if idle:
         rows.append(_md(f"⏸️ **Idle / 空闲 ({len(idle)})**"))
         for s in idle:
             rows.append(_md(_session_headline(s)))
-            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s)}"))
+            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s, with_icon=False)}"))
             rows.append(_btn_row([_btn("📊 详情", "status", s["id"])]))
 
     if active_others:
         rows.append(_md(f"🟢 **Active / 活动 ({len(active_others)})**"))
         for s in active_others:
             rows.append(_md(_session_headline(s)))
-            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s)}"))
+            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s, with_icon=False)}"))
             rows.append(_btn_row([_btn("📊 详情", "status", s["id"])]))
 
     # 提示：IDE 类型 session 需要 /status 查看精确状态
@@ -377,7 +377,7 @@ def pending_card(sessions: list[dict]) -> str:
     rows = []
     for i, s in enumerate(sessions, 1):
         rows.append(_md(_session_headline(s)))
-        rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s)}"))
+        rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s, with_icon=False)}"))
         rows.append(_btn_row([
             _btn("✅ 确认", "confirm", s["id"], "primary"),
             _btn("📊 详情", "status", s["id"]),
@@ -472,7 +472,12 @@ def streaming_card(cmd: str, output: str, done: bool = False) -> str:
     return json.dumps(card, ensure_ascii=False)
 
 
-def _session_label(s: dict) -> str:
+def _session_label(s: dict, with_icon: bool = True) -> str:
+    """会话的类型—目录标签（如 "💻 Terminal — data-infra-search (ttys000)"）
+
+    with_icon=False 用于已有图标前缀的场景（列表卡条目第二行），
+    避免同一条目上图标出现两次。
+    """
     stype = s.get("session_type", "screen")
     agent = s.get("agent", "claude")
     app = s.get("app_name", "")
@@ -487,11 +492,12 @@ def _session_label(s: dict) -> str:
         icon = "🟦"
     else:
         icon = "🔌" if stype == "ide" else "💻"
+    prefix = f"{icon} " if with_icon else ""
     if stype == "ide" and app:
-        base = f"{icon} {app} — {proj}" if proj else f"{icon} {app}"
+        base = f"{prefix}{app} — {proj}" if proj else f"{prefix}{app}"
     else:
         kind = "OpenCode" if agent == "opencode" else "Terminal"
-        base = f"{icon} {kind} — {proj}" if proj else f"{icon} {kind}"
+        base = f"{prefix}{kind} — {proj}" if proj else f"{prefix}{kind}"
     if tty:
         base += f" ({tty})"
     return base
