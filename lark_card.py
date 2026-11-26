@@ -8,6 +8,7 @@ Bilingual (EN/CN) labels.
 import json
 import os
 import re
+from dataclasses import dataclass
 
 
 def session_name(s: dict) -> str:
@@ -255,6 +256,8 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
 # 状态卡输出最多展示的字符数（末轮完整会话优先）
 _MAX_OUTPUT_CHARS = 5000
 
+# 交互卡构建参数与构建函数（见文件末尾 InteractiveState / interactive_chat_card）
+
 
 def _decision_elements(decision: dict, sid: str) -> list[dict]:
     """把识别出的决策对话框渲染成针对性按钮组
@@ -442,8 +445,135 @@ def _btn_row(buttons: list[dict]) -> dict:
     return {"tag": "action", "actions": buttons}
 
 
+# 交互卡输出区最多展示的字符数（优先保尾部——等待提示/最新结论总在末尾）
+_INTERACTIVE_MAX_CHARS = 3500
+
+
+@dataclass
+class InteractiveState:
+    """交互卡构建参数（lark_bot 交互模式每轮透传给卡片）
+
+    history 是 [(方向, 文本)] 列表：方向 "in" = 用户发送，"out" = 会话输出。
+    其余字段用于渲染状态行与操作按钮。
+    """
+
+    session: dict
+    history: list[tuple[str, str]]
+    status: str = ""          # executing / waiting / idle / ...
+    mode: str = ""            # 权限模式名（decision_detect.MODE_*）
+    model: str = ""           # 当前模型
+    model_groups: dict | None = None  # 网关模型分组（按钮快速切换用）
+    done: bool = False        # True = 本轮输出已稳定
+
+
+def _status_line(st: InteractiveState) -> str:
+    """交互卡状态行：状态 + 模式 + 模型（有则展示）"""
+    from decision_detect import MODE_LABELS
+    icons = {"executing": "🔵 执行中", "waiting": "🟡 待确认", "idle": "⏸️ 空闲",
+             "running": "🟢 运行中", "stopped": "🔴 已停止"}
+    parts = [icons.get(st.status, f"ℹ️ {st.status or '未知'}")]
+    if st.mode:
+        parts.append(f"模式: {MODE_LABELS.get(st.mode, st.mode)}")
+    if st.model:
+        parts.append(f"模型: `{st.model}`")
+    return " · ".join(parts)
+
+
+def _history_elements(st: InteractiveState) -> list[dict]:
+    """把交互历史渲染成卡片元素：用户消息引用块 + 会话输出代码块
+
+    每轮输出整体截尾到 _INTERACTIVE_MAX_CHARS，历史多轮时只保最近
+    3 轮（移动端卡片过长会折叠，最近上下文足够阅读）。
+    """
+    elements: list[dict] = []
+    history = st.history[-3:]
+    for i, (direction, text) in enumerate(history):
+        if direction == "in":
+            elements.append({"tag": "hr"})
+            elements.append(_md(f"**📩 你:** {text}"))
+        else:
+            display = text[-_INTERACTIVE_MAX_CHARS:]
+            if len(text) > _INTERACTIVE_MAX_CHARS:
+                display = "…（前文截断）\n" + display
+            if display.strip():
+                elements.append(_md(f"**🤖 会话输出**\n```\n{display}\n```"))
+    return elements
+
+
+def interactive_chat_card(st: InteractiveState) -> str:
+    """交互模式聊天卡：历史消息 + 实时状态 + Claude Code 操作按钮
+
+    每次发送/输出更新都整卡原位刷新（PATCH 同一 message_id），上下文
+    保留在卡片里方便阅读；操作按钮与状态卡一致（确认/中断/模式/模型）。
+    """
+    s = st.session
+    sid = s["id"][:8]
+    name = session_name(s) or s.get("name") or sid
+    elements = [_md(f"**会话:** {name} · `{sid}`")]
+
+    elements.extend(_history_elements(st))
+    elements.append({"tag": "hr"})
+    icon = "✅" if st.done else "⏳"
+    elements.append(_md(f"{icon} {_status_line(st)}"))
+
+    # 决策对话框：待确认时展示针对性按钮（选项直选 / y-n / 确认）
+    decision = st_decision_cache.get(s["id"])
+    if decision and decision.get("kind") != "none":
+        elements.extend(_decision_elements(decision, s["id"]))
+
+    # ── 操作按钮（与状态卡对齐）─────────────────────
+    elements.append(_btn_row([
+        _btn("✅ 确认", "confirm", s["id"], "primary"),
+        _btn("✋ 中断", "interrupt", s["id"]),
+        _btn("🔄 刷新", "irefresh", s["id"]),
+    ]))
+    # 退出交互模式（会话保持运行）——放在常用操作行，方便随时点退
+    elements.append(_btn_row([
+        _btn("🚪 退出交互", "exit-interactive", s["id"]),
+        _btn("🚫 Esc", "esc", s["id"]),
+        _btn("⏹️ 停止", "stop", s["id"]),
+    ]))
+    if s.get("session_type") != "ide" and s.get("agent", "claude") == "claude":
+        from decision_detect import MODE_CYCLE, MODE_LABELS
+        mode_btns = [
+            _btn(MODE_LABELS[m], "set-mode", s["id"],
+                 "primary" if m == st.mode else "default", {"m": m})
+            for m in MODE_CYCLE
+        ]
+        elements.append(_btn_row(mode_btns[:2]))
+        elements.append(_btn_row(mode_btns[2:]))
+    # ── 模型快速切换（与状态卡同 action，点击后卡片原位刷新）──
+    if s.get("agent", "claude") == "claude":
+        groups = st.model_groups
+        if groups is None:
+            from model_control import _CURATED_MODEL_GROUPS as groups
+        for group_name, group_models in list(groups.items())[:3]:
+            btns = [
+                _btn(m.split("/")[-1], "set-model", s["id"],
+                     "primary" if m == st.model else "default", {"m": m})
+                for m in group_models[:3]
+            ]
+            if btns:
+                elements.append(_btn_row(btns))
+    elements.append(_md(
+        "💬 直接回复消息即发送到会话 · `/exit` 退出交互 · `/exit --kill` 停止"))
+
+    card = {
+        "config": {"wide_screen_mode": False},
+        "header": {"title": {"tag": "lark_md",
+                             "content": f"💬 交互 — {name}"}},
+        "elements": elements,
+    }
+    return json.dumps(card, ensure_ascii=False)
+
+
+# 决策对话框缓存：交互卡渲染时由 lark_bot 塞入（卡片构建是纯函数，
+# 不做终端读取；None = 未读取过）
+st_decision_cache: dict[str, dict | None] = {}
+
+
 def interactive_card(cmd: str, output: str) -> str:
-    """Card showing the result of an interactive command"""
+    """Deprecated: 旧版交互结果卡，仅保留兼容（现用 interactive_chat_card）"""
     display = output[-500:] if output else "(no output yet)"
     card = {
         "config": {"wide_screen_mode": False},
@@ -457,7 +587,7 @@ def interactive_card(cmd: str, output: str) -> str:
 
 
 def streaming_card(cmd: str, output: str, done: bool = False) -> str:
-    """Card showing streaming output, updated in-place"""
+    """Deprecated: 旧版流式输出卡，仅保留兼容（现用 interactive_chat_card）"""
     icon = "✅" if done else "⏳"
     status = "Done" if done else "Executing..."
     display = output[-500:] if output else "(waiting for output...)"

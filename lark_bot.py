@@ -28,11 +28,15 @@ from lark_card import (
     pending_card,
     confirm_all_card,
     done_card,
-    interactive_card,
-    streaming_card,
+    InteractiveState,
+    interactive_chat_card,
+    st_decision_cache,
 )
 
 logger = logging.getLogger("lark_bot")
+
+# 后台任务强引用集合：防 create_task 的裸任务被 GC 中途取消
+_background_tasks: set[asyncio.Task] = set()
 
 _session_context: dict[str, dict] = {}
 
@@ -128,8 +132,10 @@ class LarkBot:
             text, card = await self._run_card_action(action, sid, chat_id, info.get("extra"))
             if card:
                 # 优先原位更新被点击的卡片；失败（或拿不到 message_id）则发新卡
-                if not (message_id and self._update_card_message(message_id, card)):
-                    self._send_card_to_chat(chat_id, card)
+                # （lark-cli subprocess 经 to_thread，避免阻塞事件循环）
+                if not (message_id and await asyncio.to_thread(
+                        self._update_card_message, message_id, card)):
+                    await asyncio.to_thread(self._send_card_to_chat, chat_id, card)
             elif text:
                 await self._send_message(chat_id, text)
             return {"code": 0}
@@ -150,7 +156,8 @@ class LarkBot:
                 return "❌ Session not found.", ""
             output, _ = await self._read_session_output(s)
             decision, mode = await self._read_decision_and_mode(s)
-            model = self._read_model(s) if s.get("agent", "claude") == "claude" else ""
+            model = (await asyncio.to_thread(self._read_model, s)
+                     if s.get("agent", "claude") == "claude" else "")
             groups = await self._fetch_model_groups() if model else None
             return "", session_status_card(s, output, decision=decision, mode=mode,
                                            model=model, model_groups=groups)
@@ -190,6 +197,34 @@ class LarkBot:
                 return "❌ Session not found.", ""
             # _cmd_enter 自己发交互卡片，这里只透传其文本提示
             return (await self._cmd_enter([sid], chat_id)) or "", ""
+        if action == "exit-interactive":
+            # 交互卡"退出交互"按钮：退出交互模式（会话保持运行）
+            s = self.registry.get(sid) if sid else None
+            if not s:
+                return "❌ Session not found.", ""
+            return (await self._cmd_exit([], chat_id)) or "", ""
+
+        if action == "irefresh":
+            # 交互卡"刷新"：仍处于交互模式的会话读最新输出，原位刷新交互卡
+            # （不是状态卡——用 status 会把交互卡替换成状态卡，丢失退出按钮，
+            # 看起来像退出了交互模式，实际 ctx["mode"] 还在）
+            s = self.registry.get(sid) if sid else None
+            if not s:
+                return "❌ Session not found.", ""
+            if _session_context.get(chat_id, {}).get("mode") != sid:
+                # 已不在交互模式：退化为状态卡
+                output, _ = await self._read_session_output(s)
+                decision, mode = await self._read_decision_and_mode(s)
+                model = (await asyncio.to_thread(self._read_model, s)
+                         if s.get("agent", "claude") == "claude" else "")
+                groups = await self._fetch_model_groups() if model else None
+                return "", session_status_card(s, output, decision=decision,
+                                               mode=mode, model=model,
+                                               model_groups=groups)
+            output = await self._read_interactive_output(s)
+            card = await self._build_interactive_card(
+                s, [("out", output)], done=True)
+            return "", card
 
         if action == "select-option":
             # 决策卡选项直选：裸字符注入选项号（对话框把数字当按键消费，
@@ -254,6 +289,11 @@ class LarkBot:
             ok = await self._dispatch_send(s, "send", f"/model {model}")
             if not ok:
                 return f"❌ Set model failed{self._send_fail_hint(s)}", ""
+            # 稍等 TUI 应用切换后读回当前模型，原位刷新被点击的卡片
+            await asyncio.sleep(1.5)
+            refreshed = await asyncio.to_thread(self._read_model, s)
+            if refreshed:
+                model = refreshed
             return (f"✅ Set model → `{model}` (`{sid[:8]}`)\n"
                     f"⚠️ TUI 会把它保存为所有新会话的默认模型"), ""
 
@@ -379,62 +419,21 @@ class LarkBot:
                 ctx["mode"] = None
                 return "❌ Session no longer exists. Exited interactive mode."
 
-            stype = s.get("session_type", "screen")
-
-            # Only screen sessions (created via /new) support interactive mode
-            if stype != "screen":
-                return "❌ Interactive mode only works with screen sessions.\nUse `/new <path>` to create one, or `/send <id> <text>` to send a single command."
-
-            ok = await self.screen_mgr.send_keys(mode_sid, text)
+            ok = await self._dispatch_send(s, "send", text)
             if not ok:
-                return "❌ Send failed, session may be stopped"
+                return (f"❌ Send failed — session tab not found or unavailable. "
+                        f"用 `/status {mode_sid[:8]}` 检查{self._send_fail_hint(s)}")
+            self.registry.update(mode_sid, status="running")
 
-            # Streaming output: send initial card, then poll and update in-place
-            log_path = s.get("log_path", f"/tmp/claude-{mode_sid}.log")
-            initial_card = streaming_card(text, "")
-            message_id = self._send_card_to_chat(chat_id, initial_card)
-            if not message_id:
-                return "❌ Failed to send card"
-
-            # Save message_id so /exit can update the card
-            ctx["last_msg_id"] = message_id
-
-            # Poll log file and update card in-place
-            last_size = 0
-            if os.path.exists(log_path):
-                try:
-                    last_size = os.path.getsize(log_path)
-                except OSError:
-                    pass
-            no_change = 0
-            for _ in range(30):  # Up to ~60 seconds
-                await asyncio.sleep(2)
-                current_size = 0
-                if os.path.exists(log_path):
-                    try:
-                        current_size = os.path.getsize(log_path)
-                    except OSError:
-                        pass
-                if current_size > last_size:
-                    last_size = current_size
-                    output = self._read_log_output(log_path)
-                    if output:
-                        self._update_card_message(message_id, streaming_card(text, output))
-                    no_change = 0
-                else:
-                    no_change += 1
-
-                # Check if output has stabilized (prompt or waiting pattern)
-                if output and self._looks_stable(output):
-                    break
-                # No change for 2 rounds (4 seconds) -> stable
-                if no_change >= 2:
-                    break
-
-            # Final update
-            output = self._read_log_output(log_path) if os.path.exists(log_path) else ""
-            self._update_card_message(message_id, streaming_card(text, output, done=True))
-            return ""  # Card sent, no text reply
+            # 交互轮询放后台任务：立即返回让事件循环继续消费下一条消息
+            # （2026-11-26 事故根因：轮询 await 在 handler 里，最长 5 分钟
+            # 阻塞整个消息事件流，/l 等命令全部无响应）
+            task = asyncio.create_task(
+                self._interactive_round(s, text, chat_id),
+                name=f"interactive-{mode_sid[:8]}")
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+            return ""
 
         # Compose 模式（卡片按钮 "发送…" 进入）：下一条非命令消息直接发到指定会话
         compose_sid = ctx.get("compose")
@@ -451,7 +450,7 @@ class LarkBot:
             ctx["selected"] = compose_sid
             label = s.get("name") or compose_sid[:8]
             return (f"✅ Sent to {label}:\n```\n$ {text}\n```"
-                    f"{self._busy_note(s)}")
+                    f"{await self._busy_note(s)}")
 
         # Normal command processing
         if not text.startswith("/"):
@@ -493,7 +492,8 @@ class LarkBot:
         sessions = self._update_list_cache(chat_id)
         if not sessions:
             return "📭 No active Claude Code sessions."
-        self._send_card_to_chat(chat_id, session_list_card(sessions))
+        await asyncio.to_thread(
+            self._send_card_to_chat, chat_id, session_list_card(sessions))
         return ""
 
     async def _cmd_status(self, args: list[str], chat_id: str) -> str:
@@ -519,7 +519,7 @@ class LarkBot:
         from ide_control import read_last_assistant_message
         from screen_manager import ScreenManager
 
-        st = read_agent_state(agent, pid, cwd)
+        st = await asyncio.to_thread(read_agent_state, agent, pid, cwd)
         used_authoritative = False
         if st and st.session_id:
             used_authoritative = True
@@ -544,10 +544,12 @@ class LarkBot:
             # 回退：没有 per-process 状态文件（老版本 claude / 子代理），按类型走老逻辑
             if stype == "ide":
                 try:
-                    ts_text, ts_iso = read_last_assistant_message(cwd, "", 1200)
+                    ts_text, ts_iso = await asyncio.to_thread(
+                        read_last_assistant_message, cwd, "", 1200)
                     if ts_text:
                         output = ts_text
-                    live_output, _ = self.ide_ctrl.read_output(s.get("app_name", ""), 50)
+                    live_output, _ = await asyncio.to_thread(
+                        self.ide_ctrl.read_output, s.get("app_name", ""), 50)
                 except Exception:
                     live_output = ""
                 if live_output and ScreenManager._looks_claude_terminal(live_output) \
@@ -573,7 +575,8 @@ class LarkBot:
                 read_via_tty = False
                 if tty:
                     try:
-                        live_output, _ = self.ide_ctrl.read_terminal_by_tty(tty, 50)
+                        live_output, _ = await asyncio.to_thread(
+                            self.ide_ctrl.read_terminal_by_tty, tty, 50)
                         if live_output:
                             read_via_tty = True
                             output = live_output
@@ -590,7 +593,8 @@ class LarkBot:
                     log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
                     import os
                     if os.path.exists(log_path):
-                        live_output = self._read_log_output(log_path)
+                        live_output = await asyncio.to_thread(
+                            self._read_log_output, log_path)
                         if live_output:
                             output = live_output
                             self.registry.update(session_id, last_output=output[-500:])
@@ -598,7 +602,8 @@ class LarkBot:
                 log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
                 import os
                 if os.path.exists(log_path):
-                    live_output = self._read_log_output(log_path)
+                    live_output = await asyncio.to_thread(
+                        self._read_log_output, log_path)
                     if live_output:
                         output = live_output
 
@@ -606,30 +611,38 @@ class LarkBot:
         s = self.registry.get(session_id)
         idx = self._find_index(session_id, chat_id)
         decision, mode = await self._read_decision_and_mode(s)
-        model = self._read_model(s) if s.get("agent", "claude") == "claude" else ""
+        model = (await asyncio.to_thread(self._read_model, s)
+                 if s.get("agent", "claude") == "claude" else "")
         groups = await self._fetch_model_groups() if model else None
-        self._send_card_to_chat(chat_id, session_status_card(s, output, idx, decision=decision, mode=mode, model=model, model_groups=groups))
+        await asyncio.to_thread(
+            self._send_card_to_chat, chat_id,
+            session_status_card(s, output, idx, decision=decision, mode=mode,
+                                model=model, model_groups=groups))
         return ""
 
     async def _cmd_pending(self, _args: list[str], chat_id: str) -> str:
         """Send pending sessions card"""
         self._update_list_cache(chat_id)
         waiting = self.registry.list(status_filter="waiting")
-        self._send_card_to_chat(chat_id, pending_card(waiting))
+        await asyncio.to_thread(
+            self._send_card_to_chat, chat_id, pending_card(waiting))
         return ""
 
     async def _cmd_confirm_all(self, _args: list[str], chat_id: str) -> str:
         """Confirm all waiting and show result card"""
         sessions = self.registry.list(status_filter="waiting")
         if not sessions:
-            self._send_card_to_chat(chat_id, done_card("✅ No sessions waiting for input."))
+            await asyncio.to_thread(
+                self._send_card_to_chat, chat_id,
+                done_card("✅ No sessions waiting for input."))
             return ""
         success = failed = 0
         for s in sessions:
             ok = await self._confirm_from_bot(s)
             if ok: success += 1
             else: failed += 1
-        self._send_card_to_chat(chat_id, confirm_all_card(success, failed))
+        await asyncio.to_thread(
+            self._send_card_to_chat, chat_id, confirm_all_card(success, failed))
         return ""
 
     # ── Text-reply commands (keep text for simple ops) ──
@@ -647,7 +660,11 @@ class LarkBot:
         ctx = _session_context.setdefault(chat_id, {})
         ctx["mode"] = session_id
         logger.info("Interactive mode: chat=%s session=%s", chat_id[:12], session_id[:8])
-        return f"🔵 Interactive mode: **{s.get('name', session_id[:8])}**\n\nType any message to send to this session.\n`/exit` to leave (session kept alive).\n`/exit --kill` to leave and stop."
+        # 发交互聊天卡（含操作按钮 + 当前状态）；此后每条消息一张流式卡，
+        # 逐张追加在聊天流里（像聊天一样滚动回看历史）
+        card = await self._build_interactive_card(s, [], done=True)
+        await asyncio.to_thread(self._send_card_to_chat, chat_id, card)
+        return ""
 
     async def _cmd_exit(self, args: list[str], chat_id: str) -> str:
         """Exit interactive mode"""
@@ -662,20 +679,11 @@ class LarkBot:
             await self._stop_from_bot(s)
         ctx["mode"] = None
         logger.info("Exit interactive mode: chat=%s kill=%s", chat_id[:12], kill)
-
-        # 更新上一次交互卡片为已停止状态
-        last_msg_id = ctx.get("last_msg_id", "")
-        if kill:
-            done = done_card(f"⏹️ **{name}** 已停止。")
-        else:
-            done = done_card(f"✅ 已退出交互模式。**{name}** 保持运行。")
-        if last_msg_id:
-            self._update_card_message(last_msg_id, done)
-            return ""  # 卡片已更新，无需文本回复
-        # 没有交互卡片可更新时，返回文本反馈
+        # 各轮流式卡保留在聊天流里可回看，这里只发一条退出提示
         if kill:
             return f"⏹️ Exited and stopped **{name}**."
-        return f"✅ Exited interactive mode. **{name}** kept alive."
+        return (f"✅ Exited interactive mode. **{name}** kept alive.\n"
+                f"重新进入: `/enter {mode_sid[:8]}`")
 
     async def _cmd_ls(self, args: list[str], chat_id: str) -> str:
         """List directory contents"""
@@ -783,89 +791,189 @@ class LarkBot:
         return False
 
     def _enter_interactive_mode(self, session_id: str, path: str, chat_id: str, started: bool) -> None:
-        """更新列表缓存并进入交互模式"""
+        """更新列表缓存并进入交互模式（/new 创建后调用）"""
         ctx = _session_context.setdefault(chat_id, {})
         sessions = self.registry.list()
         ctx["sessions"] = [s["id"] for s in sessions]
         ctx["mode"] = session_id
         logger.info("New session + interactive mode: %s %s (ready=%s)", session_id[:8], path, started)
 
-    async def _read_interactive_output(self, s: dict) -> str:
-        """Read session output for interactive mode display
+    async def _interactive_round(self, s: dict, text: str, chat_id: str) -> None:
+        """交互模式一轮对话：发送 → 流式卡实时刷新 → 稳定后定稿
 
-        Tries log file first (screen sessions via /new), then falls back
-        to Terminal.app clipboard capture (reads frontmost window).
-        OpenCode 会话从 sqlite 读最近一条 assistant 文本（日志是 TUI 乱码，不可用）。
+        每轮发送一张新流式卡（像聊天消息一样追加到聊天流），轮询期间
+        卡片原位刷新最新输出（⏳ 执行中），稳定后定稿（✅）。上一轮卡片
+        保留在聊天流里，向上滚动即可回看更早的历史。
+        由 create_task 后台运行（不阻塞事件消费），异常只记日志。
         """
-        session_id = s["id"]
-        agent = s.get("agent", "claude")
-
-        # OpenCode：直接读 sqlite 的最近 assistant 文本
-        if agent == "opencode":
-            from agent_state import read_agent_state
-            st = read_agent_state(agent, 0, s.get("cwd", ""))
-            if st and st.text:
-                return st.text
-            return "(sent — opencode 输出暂不可读，用 /status 查看)"
-
-        log_path = s.get("log_path", f"/tmp/claude-{session_id}.log")
-
-        # Try log file (screen sessions created via /new)
-        if os.path.exists(log_path):
-            try:
-                initial_size = os.path.getsize(log_path)
-            except OSError:
-                initial_size = 0
-
-            for attempt in range(10):
-                try:
-                    size = os.path.getsize(log_path)
-                    if size > initial_size or (size > 50 and attempt == 0):
-                        with open(log_path, "rb") as f:
-                            raw = f.read()
-                        if len(raw) > 50:
-                            import re
-                            text = raw.decode("utf-8", errors="replace")
-                            text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
-                            text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-                            lines = [l.strip() for l in text.splitlines() if l.strip()]
-                            clean = [l for l in lines if len(l) > 5]
-                            if clean:
-                                return "\n".join(clean[-25:])
-                            return text[-500:]
-                except (OSError, IOError):
-                    pass
-                await asyncio.sleep(1)
-
-        # Fallback: 按 TTY 精确读取该会话自己的 Terminal tab（非侵入、不串台）
-        tty = session_tty(s)
-        if tty:
-            out, _ = self.ide_ctrl.read_terminal_by_tty(tty, 25)
-            if out:
-                lines = [l.strip() for l in out.splitlines()
-                         if l.strip() and not l.strip().startswith("─")
-                         and not l.strip().startswith("❯")
-                         and not l.strip().startswith("  ⏵")]
-                if lines:
-                    return "\n".join(lines[-20:])
-
-        # Last resort: Terminal.app clipboard (reads frontmost window)
-        # 仅当无 TTY 时使用，多窗口时可能读错会话
         try:
-            for attempt in range(4):
-                await asyncio.sleep(1)
-                out, _ = self.ide_ctrl.read_terminal_full_output(25)
-                if out and len(out) > 50:
-                    lines = [l.strip() for l in out.splitlines()
-                             if l.strip() and not l.strip().startswith("─")
-                             and not l.strip().startswith("❯")
-                             and not l.strip().startswith("  ⏵")]
-                    if lines:
-                        return "\n".join(lines[-20:])
-        except Exception:
-            pass
+            await self._interactive_round_inner(s, text, chat_id)
+        except Exception as e:
+            logger.error("Interactive round failed: %s", e, exc_info=True)
 
-        return "(sent — view output in the terminal directly)"
+    async def _interactive_round_inner(self, s: dict, text: str, chat_id: str) -> None:
+        """_interactive_round 的实际执行体（异常由外层兜底）"""
+        # 发送即建卡（⏳ 状态），后续原位刷新
+        card = await self._build_interactive_card(s, [("in", text)], done=False)
+        message_id = await asyncio.to_thread(
+            self._send_card_to_chat, chat_id, card)
+        if not message_id:
+            # 卡片发送失败：退化为文本回复（消息已发到会话，不丢）
+            output = await self._poll_interactive_output(s)
+            await self._send_message(
+                chat_id,
+                f"📤 Sent to {s.get('name', s['id'][:8])}:\n```\n$ {text}\n```"
+                f"\n🤖 Output:\n```\n{output[-800:]}\n```")
+            return
+
+        # 轮询输出：有新内容即原位刷新卡片（实时流式效果）
+        import time as _time
+        deadline = _time.monotonic() + 300  # 最长 5 分钟
+        last_output = ""
+        stable_rounds = 0
+        last_refresh = 0.0
+        while _time.monotonic() < deadline:
+            await asyncio.sleep(2.0)
+            output = await self._read_interactive_output(s)
+            if output and output != last_output:
+                last_output = output
+                stable_rounds = 0
+                # 节流：至少 3s 刷一次卡，避免 PATCH 风暴
+                now = _time.monotonic()
+                if now - last_refresh >= 3.0:
+                    await asyncio.to_thread(
+                        self._update_card_message, message_id,
+                        await self._build_interactive_card(
+                            s, [("in", text), ("out", last_output)], done=False))
+                    last_refresh = now
+            else:
+                stable_rounds += 1
+            # 输出停更 2 轮（~4s）或出现等待提示 → 稳定
+            if last_output and stable_rounds >= 2:
+                break
+            if last_output and self._looks_stable(last_output):
+                break
+            # 权威状态回到 waiting/idle → 稳定（claude 状态文件）
+            from agent_state import read_agent_state
+            st = await asyncio.to_thread(
+                read_agent_state,
+                s.get("agent", "claude"), s.get("pid", 0), s.get("cwd", ""))
+            if st and st.status in ("waiting", "idle"):
+                if not last_output and st.text:
+                    last_output = st.text
+                break
+
+        # 定稿：✅ 状态 + 最终输出（含决策对话框按钮 + 操作按钮）
+        final_card = await self._build_interactive_card(
+            s, [("in", text), ("out", last_output)], done=True)
+        await asyncio.to_thread(self._update_card_message, message_id, final_card)
+
+    async def _build_interactive_card(self, s: dict, history: list[tuple[str, str]],
+                                      done: bool) -> str:
+        """构建交互聊天卡：读取实时状态/模式/模型 + 决策对话框后渲染
+
+        所有同步 IO（AppleScript 读终端 / 状态文件 / transcript）均经
+        to_thread 执行，避免阻塞事件循环。
+        """
+        decision, mode = await self._read_decision_and_mode(s)
+        st_decision_cache[s["id"]] = decision
+        model = (await asyncio.to_thread(self._read_model, s)
+                 if s.get("agent", "claude") == "claude" else "")
+        groups = await self._fetch_model_groups() if model else None
+        status = s.get("status", "")
+        # 发送后短等状态文件刷新，避免显示上一轮的 executing
+        if not done:
+            await asyncio.sleep(1.0)
+            from agent_state import read_agent_state
+            st = await asyncio.to_thread(
+                read_agent_state,
+                s.get("agent", "claude"), s.get("pid", 0), s.get("cwd", ""))
+            if st and st.status:
+                status = st.status
+        state = InteractiveState(session=s, history=history, status=status,
+                                 mode=mode, model=model, model_groups=groups,
+                                 done=done)
+        return interactive_chat_card(state)
+
+    async def _poll_interactive_output(self, s: dict) -> str:
+        """轮询会话输出直到稳定（等待提示 / 输出停更），返回末轮输出
+
+        已被 _interactive_round 的内联轮询取代，仅保留给卡片发送失败的
+        退化路径使用。
+        """
+        import time as _time
+        deadline = _time.monotonic() + 90  # 最长 90s
+        last_output = ""
+        stable_rounds = 0
+        while _time.monotonic() < deadline:
+            await asyncio.sleep(2.5)
+            output = await self._read_interactive_output(s)
+            if output and output != last_output:
+                last_output = output
+                stable_rounds = 0
+            else:
+                stable_rounds += 1
+            # 输出停更 2 轮（~5s）或出现等待提示 → 稳定
+            if last_output and stable_rounds >= 2:
+                break
+            if last_output and self._looks_stable(last_output):
+                break
+            # 权威状态回到 waiting/idle → 稳定（claude 状态文件）
+            from agent_state import read_agent_state
+            st = await asyncio.to_thread(
+                read_agent_state,
+                s.get("agent", "claude"), s.get("pid", 0), s.get("cwd", ""))
+            if st and st.status in ("waiting", "idle"):
+                if not last_output and st.text:
+                    last_output = st.text
+                break
+        return last_output
+
+    async def _read_interactive_output(self, s: dict) -> str:
+        """读取会话当前可见输出（交互模式展示用）
+
+        按会话类型路由：opencode 读 sqlite 最近 assistant 文本（TUI 日志
+        是乱码不可用）；screen 读日志文件；terminal 按 TTY 读 tab（无 TTY
+        时退回日志文件）。读不到返回占位提示。
+        所有同步 IO（AppleScript / 文件读取）均经 to_thread 执行，
+        避免阻塞事件循环（2026-11-26 /l 无响应事故根因）。
+        """
+        agent = s.get("agent", "claude")
+        if agent == "opencode":
+            return await asyncio.to_thread(self._read_opencode_text, s)
+        stype = s.get("session_type", "screen")
+        tty = session_tty(s)
+        if stype in ("terminal", "ide") and tty:
+            out, _ = await asyncio.to_thread(
+                self.ide_ctrl.read_terminal_by_tty, tty, 30)
+            cleaned = self._clean_terminal_lines(out)
+            if cleaned:
+                return cleaned
+        # screen / 无 TTY 的 terminal：读日志文件
+        log_path = s.get("log_path", f"/tmp/claude-{s['id']}.log")
+        output = await asyncio.to_thread(self._read_log_output, log_path)
+        if output:
+            return output
+        return "(暂无可读输出，用 /status 查看)"
+
+    def _read_opencode_text(self, s: dict) -> str:
+        """OpenCode：读 sqlite 最近一条 assistant 文本"""
+        from agent_state import read_agent_state
+        st = read_agent_state("opencode", 0, s.get("cwd", ""))
+        if st and st.text:
+            return st.text
+        return "(sent — opencode 输出暂不可读，用 /status 查看)"
+
+    @staticmethod
+    def _clean_terminal_lines(out: str) -> str:
+        """清理终端可见文本：去掉分隔线/提示符行，保留末尾内容行"""
+        if not out:
+            return ""
+        lines = [l.strip() for l in out.splitlines()
+                 if l.strip() and not l.strip().startswith("─")
+                 and not l.strip().startswith("❯")
+                 and not l.strip().startswith("  ⏵")]
+        return "\n".join(lines[-20:])
 
     async def _read_session_visible(
         self, s: dict, stype: str, agent: str
@@ -876,6 +984,7 @@ class LarkBot:
         screen 会话读 tmux pane（capture-pane，非侵入）——仅 opencode，
         claude screen 有 log 文件走原逻辑；
         ide 会话不抢焦点读屏，返回空串。
+        AppleScript 经 to_thread 执行，避免阻塞事件循环。
         """
         if stype == "terminal":
             # registry.get 返回的 tags 是 JSON 字符串，session_tty 统一解析
@@ -883,7 +992,8 @@ class LarkBot:
             if not tty:
                 return ""
             try:
-                live_output, _ = self.ide_ctrl.read_terminal_by_tty(tty, 40)
+                live_output, _ = await asyncio.to_thread(
+                    self.ide_ctrl.read_terminal_by_tty, tty, 40)
                 return live_output
             except Exception:
                 return ""
@@ -937,7 +1047,7 @@ class LarkBot:
             self.registry.update(session_id, status="running")
             _session_context.setdefault(chat_id, {})["selected"] = session_id
             return (f"✅ Sent to {s.get('name', session_id[:8])}:\n```\n$ {text}\n```"
-                    f"{self._busy_note(s)}")
+                    f"{await self._busy_note(s)}")
         # 失败主因是 tab 已关闭（terminal）或 tmux 会话消失（screen），
         # 无头 do script 路径不再依赖焦点，锁屏不会导致此失败
         return (f"❌ Send failed — session tab not found or unavailable. "
@@ -1103,7 +1213,7 @@ class LarkBot:
             return "❌ Session no longer exists"
         if s.get("agent") != "claude":
             return "❌ 仅 Claude Code 会话支持模型切换"
-        current = self._read_model(s)
+        current = await asyncio.to_thread(self._read_model, s)
         if len(args) < 2:
             from model_control import collect_known_models
             groups = await self._fetch_model_groups()
@@ -1254,17 +1364,19 @@ class LarkBot:
         """
         return await send_to_session(self.ide_ctrl, self.screen_mgr, s, action, text)
 
-    def _busy_note(self, s: dict) -> str:
+    async def _busy_note(self, s: dict) -> str:
         """发送后检查会话是否忙碌，忙碌时提示消息已排队
 
         Claude Code / OpenCode 均支持生成中提交新消息（自动排队，
         当前任务结束后处理）。忙碌中的提示语与空闲时区分，避免用户
         误以为消息会在本轮立即生效。
+        AppleScript 读终端经 to_thread 执行。
         """
         tty = session_tty(s)
         if not tty or s.get("session_type") not in ("terminal", "standalone"):
             return ""
-        tail, _ = self.ide_ctrl.read_terminal_by_tty(tty, 15)
+        tail, _ = await asyncio.to_thread(
+            self.ide_ctrl.read_terminal_by_tty, tty, 15)
         if tail and IDEControl._tui_busy(tail):
             return "\n\n⏳ 会话正在执行中：消息已排队，将在当前任务结束后处理。"
         return ""
@@ -1313,6 +1425,7 @@ class LarkBot:
         return -1
 
     async def _read_session_output(self, s: dict) -> tuple[str, int]:
+        """读取会话输出（状态卡展示用），同步 IO 均经 to_thread 执行"""
         stype = s.get("session_type", "screen")
         session_id = s["id"]
         if stype == "ide":
@@ -1322,18 +1435,24 @@ class LarkBot:
             # 抓屏仅作状态文件缺失时的兜底。
             from ide_control import read_claude_session_state, read_last_assistant_message
             pid = s.get("pid", 0)
-            cs = read_claude_session_state(pid) if pid else None
+            cs = await asyncio.to_thread(read_claude_session_state, pid) if pid else None
             if cs:
                 sid = cs.get("sessionId", "")
-                text, _ = read_last_assistant_message(s.get("cwd", ""), sid, 5000)
+                text, _ = await asyncio.to_thread(
+                    read_last_assistant_message, s.get("cwd", ""), sid, 5000)
                 if text:
                     return text, len(text.splitlines())
-            return self.ide_ctrl.read_output(s.get("app_name", ""), 15)
+            out, lc = await asyncio.to_thread(
+                self.ide_ctrl.read_output, s.get("app_name", ""), 15)
+            return out, lc
         elif stype == "terminal":
             # 按 TTY 精确读取该会话自己的 Terminal tab（非侵入、不抢焦点）。
             # 不能用 read_terminal_full_output —— 它读的是最前台窗口，所有会话会串台
             tty = session_tty(s)
-            output, lc = self.ide_ctrl.read_terminal_by_tty(tty, 120) if tty else ("", 0)
+            output, lc = ("", 0)
+            if tty:
+                output, lc = await asyncio.to_thread(
+                    self.ide_ctrl.read_terminal_by_tty, tty, 120)
             if output:
                 # 过滤分隔线/提示符行，只保留有意义的内容
                 lines = [l for l in output.splitlines()

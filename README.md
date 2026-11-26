@@ -124,14 +124,14 @@ If you already have `claude` or `opencode` running in a terminal or IDE, `scan-e
 **Interactive mode flow / 交互模式流程:**
 ```
 /l          → see sessions, note the number
-/enter 1    → enter interactive mode with session 1
-pwd         → sent to session, output returned (streaming card updates)
-ls -la      → sent to session
-/exit       → leave interactive mode, session kept alive
-/exit --kill → leave and stop session (card updated with stop status)
+/enter 1    → enter interactive mode with session 1 (interactive card sent)
+pwd         → a streaming card appears (⏳), output updates live in-place, settles to ✅
+ls -la      → another streaming card (earlier cards stay in the chat — scroll up to review)
+/exit       → leave interactive mode, session kept alive (or tap 🚪 退出交互 on the card)
+/exit --kill → leave and stop session
 ```
 
-> **Streaming output:** Interactive mode sends commands to tmux, then polls the log file every 2 seconds and updates the Lark card in-place via PATCH API. You see output appear progressively as the command executes — no more waiting for completion.
+> **Live streaming / 实时流式:** each message you send creates a chat-style card that updates in-place while the session works (⏳ executing → ✅ done), showing your command, the latest session output, live status/mode/model, and action buttons (✅ 确认 / ✋ 中断 / 🚪 退出交互 / Esc / 停止 / mode & model quick-switch). Earlier rounds stay in the chat history — scroll up to read them, like a real conversation. Works with all session types — tmux (`/new`, `lcc`), Terminal.app tabs (by TTY), and OpenCode.
 
 ### Control Commands / 控制命令
 
@@ -163,7 +163,7 @@ ls -la      → sent to session
 - `/send` to terminal sessions uses Terminal's `do script ... in tab` (headless: no focus, no clipboard, works with the screen locked; CJK text works natively). All text (single- and multi-line) is sent as a bracketed paste (ESC[200~ ... ESC[201~) followed by a separate delayed Enter — a lone CR is never glued to the text chunk, because that triggers the TUI's paste detection and the message stays as an unsubmitted draft. With the split injection, messages submitted while the agent is generating are queued natively (both Claude Code and OpenCode support mid-generation queueing) and processed after the current task; a background verifier re-sends Enter only as a fallback if the text still sits in the input box
 - `/interrupt` on terminal sessions sends SIGINT to the tty's foreground process group — exactly equivalent to Ctrl+C, also works headless
 - ID supports fuzzy matching — first 8 chars are sufficient
-- `/exit --kill` updates the last interactive card with stop status
+- `/exit --kill` updates the interactive chat card with stop status (history stays readable)
 - `/status <id>` reads live terminal output for IDE sessions — detects waiting/idle/executing
 
 Card button clicks require the Lark app to subscribe the `card.action.trigger` event (same event-consume mechanism as messages — no webhook needed).
@@ -181,9 +181,9 @@ Sessions are tagged by **agent** (Claude 🟦/💻 vs OpenCode 🟦) and **type*
 | Icon | Agent / Type | Output Reading | Interactive Mode | Status Detection |
 |:----:|------|:-------------:|:----------------:|:----------------:|
 | 💻 | Claude — Tmux (`/new`, `lcc`) | Log file ✅ | ✅ Full support (streaming) | ✅ Auto (log + state file) |
-| 💻 | Claude — Terminal/IDE (native) | Live read (`/status`) | ⚠️ Send only | ✅ Auto (state file) |
+| 💻 | Claude — Terminal/IDE (native) | Live read (`/status`) | ✅ Full support (TTY read) | ✅ Auto (state file) |
 | 🟦 | OpenCode — Tmux (`/new-opencode`, `loc`) | SQLite ✅ | ✅ (last assistant text) | ✅ Auto (SQLite + tmux pane) |
-| 🟦 | OpenCode — Terminal (native) | SQLite (`/status`) | ⚠️ Send only | ✅ Auto (SQLite + TTY) |
+| 🟦 | OpenCode — Terminal (native) | SQLite (`/status`) | ✅ (last assistant text) | ✅ Auto (SQLite + TTY) |
 
 > **OpenCode status** is read from `~/.local/share/opencode/opencode.db`: `idle` when the last step finished with `reason=stop`, `executing` otherwise (stale >120s → idle). The SQLite state only distinguishes `idle`/`executing` — the permission-prompt (`waiting`) is rendered in the TUI and never persisted to the DB, so it is detected separately by scraping the terminal's visible text: **tmux `capture-pane`** for tmux sessions, **TTY read** for native terminal sessions (both non-invasive, no focus steal). IDE sessions skip the scrape (would steal focus) — use `/status` for those.
 
@@ -219,8 +219,8 @@ Each session in `/l` shows:
 ```
 /Users/dp/repo/claude-remote/
 ├── daemon.py           # Main daemon — HTTP API + health check + event consume
-├── lark_bot.py         # Lark bot — command parsing, interactive mode, streaming card updates
-├── lark_card.py        # Card builder — session list, status, streaming, done cards
+├── lark_bot.py         # Lark bot — command parsing, interactive mode (streaming per-round cards)
+├── lark_card.py        # Card builder — session list, status, interactive chat, done cards
 ├── screen_manager.py   # Tmux session lifecycle management (replaces macOS broken screen)
 ├── registry.py         # SQLite session registry
 ├── ide_control.py      # IDE terminal control via AppleScript
@@ -275,6 +275,17 @@ The `-t 0` flag is passed to `script` to flush output after every character I/O 
 ### Duplicate session prevention
 
 Each registered session has a `user_stopped` tag when stopped by the user. The `scan-existing` heartbeat daemon skips user-stopped sessions, preventing them from being re-activated.
+
+### Event pipeline internals / 事件链路要点
+
+Two hard-won invariants, violated in the 2026-11-26 outage (`/l` unresponsive):
+
+1. **Never run sync IO on the event loop.** `event_consume_loop` awaits handlers sequentially; one blocked handler stalls *all* message/card events. AppleScript reads (`read_terminal_by_tty`, 8s timeout), transcript tails (`read_session_model`, 10s), and lark-cli subprocesses (`_send_card_to_chat` / `_update_card_message`) must all go through `asyncio.to_thread` (see `dispatch.py` for the original rationale). Long-running interactive-round polling is launched via `asyncio.create_task` (strong-referenced in `_background_tasks`) so the handler returns immediately.
+2. **Never stop the event bus on daemon restart.** The bus is a resident process that outlives daemon restarts by design. Stopping it (`lark-cli event stop --force`) and immediately restarting produces a bus whose WebSocket connects fine but receives **no events from Lark for up to ~40 minutes** — the server-side subscription of the old connection is still held, and the new subscription is ignored. Only the wake watchdog (`_wake_watchdog`) should ever stop the bus (after system sleep). `restart.sh` accordingly never touches the bus.
+
+### Interactive mode card actions / 交互卡按钮
+
+The interactive chat card's buttons all keep you in interactive mode: `confirm` / `interrupt` / `irefresh` (re-reads the latest session output and refreshes the same interactive card) / `exit-interactive` / `esc` / `stop` / `set-mode` / `set-model`. `irefresh` deliberately does *not* reuse the status-card action — PATCHing a status card over the interactive card removed the exit button and looked like interactive mode had been dropped.
 
 ## License / 许可证
 
