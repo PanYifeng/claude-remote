@@ -35,6 +35,14 @@ from lark_card import (
 
 logger = logging.getLogger("lark_bot")
 
+# TUI 斜杠快捷命令（卡片按钮 → 注入 "/<cmd>" 由 Claude Code TUI 执行）
+# label 是按钮文案，confirm 是需要用户知晓的后果提示（None = 无害）
+_TUI_COMMANDS: dict[str, dict] = {
+    "clear": {"label": "🧹 /clear", "confirm": None},
+    "compact": {"label": "📦 /compact", "confirm": None},
+    "help": {"label": "❓ /help", "confirm": None},
+}
+
 # 后台任务强引用集合：防 create_task 的裸任务被 GC 中途取消
 _background_tasks: set[asyncio.Task] = set()
 
@@ -296,6 +304,20 @@ class LarkBot:
                 model = refreshed
             return (f"✅ Set model → `{model}` (`{sid[:8]}`)\n"
                     f"⚠️ TUI 会把它保存为所有新会话的默认模型"), ""
+
+        if action == "tui-cmd":
+            # TUI 斜杠快捷命令（/clear /compact /help /model 等可扩展）：
+            # 注入 "/<cmd>" + 回车，TUI 直接执行（实测无需对话框交互）
+            s = self.registry.get(sid) if sid else None
+            if not s or not extra or not extra.get("c"):
+                return "❌ Session or command not found.", ""
+            tui_cmd = "/" + str(extra["c"])
+            ok = await self._dispatch_send(s, "send", tui_cmd)
+            if not ok:
+                return f"❌ Command failed{self._send_fail_hint(s)}", ""
+            self.registry.update(sid, status="running")
+            label = _TUI_COMMANDS.get(str(extra["c"]), {}).get("label", tui_cmd)
+            return f"✅ {label} → `{sid[:8]}`", ""
 
         return f"Unknown card action: {action}", ""
 

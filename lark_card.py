@@ -179,9 +179,9 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
     if decision and decision.get("kind") != "none":
         elements.extend(_decision_elements(decision, s["id"]))
 
+    # ── 区 1：会话操作（确认/中断/停止 + 发送/交互/刷新）──
     elements.append({"tag": "hr"})
-    # ── 会话操作 ─────────────────────────────
-    elements.append(_md("**操作**"))
+    elements.append(_md("**▶️ 运行控制**"))
     elements.append(_btn_row([
         _btn("✅ 确认", "confirm", s["id"], "primary"),
         _btn("✋ 中断", "interrupt", s["id"]),
@@ -193,10 +193,16 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
         _btn("🔄 刷新", "status", s["id"]),
     ]))
 
-    # ── 权限模式（Claude Code：Shift+Tab 循环）+ Esc ──
+    # ── 区 2：TUI 快捷命令（/clear /compact /help）──
+    if s.get("agent", "claude") == "claude":
+        elements.append({"tag": "hr"})
+        elements.append(_md("**🧰 快捷命令**"))
+        elements.append(_btn_row(_tui_cmd_buttons(s["id"])))
+
+    # ── 区 3：权限模式（Claude Code：Shift+Tab 循环）+ Esc ──
     if stype != "ide" and s.get("agent", "claude") == "claude":
         elements.append({"tag": "hr"})
-        elements.append(_md("**权限模式**"))
+        elements.append(_md("**🔑 权限模式**"))
         # 直达四个循环模式（当前模式高亮为 primary，其余 default）
         from decision_detect import MODE_CYCLE, MODE_LABELS
         mode_btns = [
@@ -211,10 +217,10 @@ def session_status_card(s: dict, output: str = "", idx: int = -1,
             _btn("🚫 Esc", "esc", s["id"]),
         ]))
 
-    # ── 模型切换 ────────────────────────────
+    # ── 区 4：模型切换 ────────────────────────
     if s.get("agent", "claude") == "claude":
         elements.append({"tag": "hr"})
-        elements.append(_md("**模型**"))
+        elements.append(_md("**🤖 模型**"))
         # 分组由调用方预取传入（含网络 IO，不在卡片构建里拉）；
         # 未传时回退内置精选
         if model_groups is None:
@@ -500,15 +506,34 @@ def _history_elements(st: InteractiveState) -> list[dict]:
     return elements
 
 
+# TUI 斜杠快捷命令按钮定义（与 lark_bot._TUI_COMMANDS 保持一致；
+# 不直接 import 避免循环依赖——lark_bot import lark_card）
+_TUI_COMMANDS: dict[str, str] = {
+    "clear": "🧹 /clear",
+    "compact": "📦 /compact",
+    "help": "❓ /help",
+}
+
+
+def _tui_cmd_buttons(sid: str) -> list[dict]:
+    """TUI 斜杠快捷命令按钮（/clear /compact 等）"""
+    return [
+        _btn(label, "tui-cmd", sid, "default", {"c": cmd})
+        for cmd, label in _TUI_COMMANDS.items()
+    ]
+
+
 def interactive_chat_card(st: InteractiveState) -> str:
     """交互模式聊天卡：历史消息 + 实时状态 + Claude Code 操作按钮
 
-    每次发送/输出更新都整卡原位刷新（PATCH 同一 message_id），上下文
-    保留在卡片里方便阅读；操作按钮与状态卡一致（确认/中断/模式/模型）。
+    布局按功能分区（操作区 / 会话管理区 / 模式区 / 模型区 / 命令区），
+    每区一条 hr 分隔线 + 区标题，避免不同类别的按钮混在一起。
+    每次输出更新都整卡原位刷新（PATCH 同一 message_id）。
     """
     s = st.session
     sid = s["id"][:8]
     name = session_name(s) or s.get("name") or sid
+    is_claude = s.get("agent", "claude") == "claude"
     elements = [_md(f"**会话:** {name} · `{sid}`")]
 
     elements.extend(_history_elements(st))
@@ -521,19 +546,31 @@ def interactive_chat_card(st: InteractiveState) -> str:
     if decision and decision.get("kind") != "none":
         elements.extend(_decision_elements(decision, s["id"]))
 
-    # ── 操作按钮（与状态卡对齐）─────────────────────
+    # ── 区 1：运行控制（确认/中断/刷新）────────────
+    elements.append({"tag": "hr"})
+    elements.append(_md("**▶️ 运行控制**"))
     elements.append(_btn_row([
         _btn("✅ 确认", "confirm", s["id"], "primary"),
         _btn("✋ 中断", "interrupt", s["id"]),
         _btn("🔄 刷新", "irefresh", s["id"]),
     ]))
-    # 退出交互模式（会话保持运行）——放在常用操作行，方便随时点退
+
+    # ── 区 2：会话管理（退出/Esc/停止/TUI 命令）─────
+    elements.append({"tag": "hr"})
+    elements.append(_md("**🗂️ 会话管理**"))
     elements.append(_btn_row([
         _btn("🚪 退出交互", "exit-interactive", s["id"]),
         _btn("🚫 Esc", "esc", s["id"]),
         _btn("⏹️ 停止", "stop", s["id"]),
     ]))
-    if s.get("session_type") != "ide" and s.get("agent", "claude") == "claude":
+    if is_claude:
+        # TUI 斜杠快捷命令（/clear 清空上下文 /compact 压缩等）
+        elements.append(_btn_row(_tui_cmd_buttons(s["id"])))
+
+    # ── 区 3：权限模式（Claude Code）──────────────
+    if s.get("session_type") != "ide" and is_claude:
+        elements.append({"tag": "hr"})
+        elements.append(_md("**🔑 权限模式**"))
         from decision_detect import MODE_CYCLE, MODE_LABELS
         mode_btns = [
             _btn(MODE_LABELS[m], "set-mode", s["id"],
@@ -542,8 +579,11 @@ def interactive_chat_card(st: InteractiveState) -> str:
         ]
         elements.append(_btn_row(mode_btns[:2]))
         elements.append(_btn_row(mode_btns[2:]))
-    # ── 模型快速切换（与状态卡同 action，点击后卡片原位刷新）──
-    if s.get("agent", "claude") == "claude":
+
+    # ── 区 4：模型切换 ──────────────────────────
+    if is_claude:
+        elements.append({"tag": "hr"})
+        elements.append(_md("**🤖 模型**"))
         groups = st.model_groups
         if groups is None:
             from model_control import _CURATED_MODEL_GROUPS as groups
@@ -555,6 +595,9 @@ def interactive_chat_card(st: InteractiveState) -> str:
             ]
             if btns:
                 elements.append(_btn_row(btns))
+
+    # ── 底部提示 ───────────────────────────────
+    elements.append({"tag": "hr"})
     elements.append(_md(
         "💬 直接回复消息即发送到会话 · `/exit` 退出交互 · `/exit --kill` 停止"))
 
