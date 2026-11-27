@@ -52,6 +52,30 @@ def _session_headline(s: dict) -> str:
     return f"{_session_icon(s)} **{name}**"
 
 
+def session_model(s: dict) -> str:
+    """会话当前使用的模型（transcript 最后一条 assistant 的 model）
+
+    来源 ~/.claude/sessions/<pid>.json 的 sessionId → transcript .jsonl。
+    与 lark_bot._read_model 等价，但此处供卡片渲染使用（调用方负责
+    在线程池里预取，卡片构建本身不碰 IO）。opencode / 无 pid 返回空串。
+    """
+    if s.get("agent", "claude") != "claude":
+        return ""
+    pid = s.get("pid", 0)
+    if not pid:
+        return ""
+    try:
+        fp = os.path.join(os.path.expanduser("~"), ".claude", "sessions", f"{pid}.json")
+        with open(fp, encoding="utf-8") as f:
+            sid = json.load(f).get("sessionId", "")
+    except Exception:
+        return ""
+    if not sid:
+        return ""
+    from model_control import read_session_model
+    return read_session_model(s.get("cwd", ""), sid)
+
+
 def _session_icon(s: dict) -> str:
     """会话类型图标（🟦 OpenCode / 🔌 IDE / 💻 Terminal）"""
     if s.get("agent", "claude") == "opencode":
@@ -59,7 +83,21 @@ def _session_icon(s: dict) -> str:
     return "🔌" if s.get("session_type") == "ide" else "💻"
 
 
-def session_list_card(sessions: list[dict]) -> str:
+def _session_detail_line(s: dict, models: dict[str, str] | None = None) -> str:
+    """条目的第二行：短 ID · 类型—目录 · 当前模型（有则展示）
+
+    模型由调用方预取（transcript IO 不在卡片构建里做），缺失时只显示
+    ID 与目录，不影响布局。
+    """
+    parts = [f"`{s['id'][:8]}`", _session_label(s, with_icon=False)]
+    model = (models or {}).get(s["id"], "")
+    if model:
+        parts.append(f"🤖 {model.split('/')[-1]}")
+    return "　　" + " · ".join(parts)
+
+
+def session_list_card(sessions: list[dict],
+                      models: dict[str, str] | None = None) -> str:
     active = [s for s in sessions if s.get("status") != "stopped"]
     if not active:
         active = sessions[:5]
@@ -78,7 +116,7 @@ def session_list_card(sessions: list[dict]) -> str:
         rows.append(_md(f"🟡 **Waiting / 待确认 ({len(waiting)})**"))
         for s in waiting:
             rows.append(_md(_session_headline(s)))
-            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s, with_icon=False)}"))
+            rows.append(_md(_session_detail_line(s, models)))
             rows.append(_btn_row([
                 _btn("✅ 确认", "confirm", s["id"], "primary"),
                 _btn("📊 详情", "status", s["id"]),
@@ -89,21 +127,21 @@ def session_list_card(sessions: list[dict]) -> str:
         rows.append(_md(f"🔵 **Executing / 执行中 ({len(executing)})**"))
         for s in executing:
             rows.append(_md(_session_headline(s)))
-            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s, with_icon=False)}"))
+            rows.append(_md(_session_detail_line(s, models)))
             rows.append(_btn_row([_btn("📊 详情", "status", s["id"])]))
 
     if idle:
         rows.append(_md(f"⏸️ **Idle / 空闲 ({len(idle)})**"))
         for s in idle:
             rows.append(_md(_session_headline(s)))
-            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s, with_icon=False)}"))
+            rows.append(_md(_session_detail_line(s, models)))
             rows.append(_btn_row([_btn("📊 详情", "status", s["id"])]))
 
     if active_others:
         rows.append(_md(f"🟢 **Active / 活动 ({len(active_others)})**"))
         for s in active_others:
             rows.append(_md(_session_headline(s)))
-            rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s, with_icon=False)}"))
+            rows.append(_md(_session_detail_line(s, models)))
             rows.append(_btn_row([_btn("📊 详情", "status", s["id"])]))
 
     # 提示：IDE 类型 session 需要 /status 查看精确状态
@@ -380,13 +418,14 @@ def _distinct_words(text: str) -> list[str]:
     return words[:4]
 
 
-def pending_card(sessions: list[dict]) -> str:
+def pending_card(sessions: list[dict],
+                 models: dict[str, str] | None = None) -> str:
     if not sessions:
         return done_card("✅ No sessions waiting for input. / 无待确认会话")
     rows = []
     for i, s in enumerate(sessions, 1):
         rows.append(_md(_session_headline(s)))
-        rows.append(_md(f"　　`{s['id'][:8]}` · {_session_label(s, with_icon=False)}"))
+        rows.append(_md(_session_detail_line(s, models)))
         rows.append(_btn_row([
             _btn("✅ 确认", "confirm", s["id"], "primary"),
             _btn("📊 详情", "status", s["id"]),

@@ -156,7 +156,8 @@ class LarkBot:
         """执行卡片动作，返回 (text, card_json)，二者最多一个非空"""
         if action in ("list", "refresh"):
             sessions = self._update_list_cache(chat_id)
-            return "", session_list_card(sessions)
+            models = await self._fetch_session_models(sessions)
+            return "", session_list_card(sessions, models)
 
         if action == "status":
             s = self.registry.get(sid) if sid else None
@@ -185,7 +186,8 @@ class LarkBot:
 
         if action == "pending":
             waiting = self.registry.list(status_filter="waiting")
-            return "", pending_card(waiting)
+            models = await self._fetch_session_models(waiting)
+            return "", pending_card(waiting, models)
 
         if action == "confirm-all":
             waiting = self.registry.list(status_filter="waiting")
@@ -514,8 +516,9 @@ class LarkBot:
         sessions = self._update_list_cache(chat_id)
         if not sessions:
             return "📭 No active Claude Code sessions."
+        models = await self._fetch_session_models(sessions)
         await asyncio.to_thread(
-            self._send_card_to_chat, chat_id, session_list_card(sessions))
+            self._send_card_to_chat, chat_id, session_list_card(sessions, models))
         return ""
 
     async def _cmd_status(self, args: list[str], chat_id: str) -> str:
@@ -646,8 +649,9 @@ class LarkBot:
         """Send pending sessions card"""
         self._update_list_cache(chat_id)
         waiting = self.registry.list(status_filter="waiting")
+        models = await self._fetch_session_models(waiting)
         await asyncio.to_thread(
-            self._send_card_to_chat, chat_id, pending_card(waiting))
+            self._send_card_to_chat, chat_id, pending_card(waiting, models))
         return ""
 
     async def _cmd_confirm_all(self, _args: list[str], chat_id: str) -> str:
@@ -1286,6 +1290,27 @@ class LarkBot:
         """异步预取模型分组（网关 IO 不阻塞事件循环，5 分钟缓存）"""
         from model_control import fetch_model_groups
         return await asyncio.to_thread(fetch_model_groups)
+
+    async def _fetch_session_models(self, sessions: list[dict]) -> dict[str, str]:
+        """批量预取会话当前模型（session_id → model）
+
+        列表卡/待确认卡要展示每个会话在用的模型。读 transcript 是
+        subprocess IO，逐个串行会拖慢卡片（10 个会话最多 10×10s），
+        这里并发跑在线程池里，整体耗时≈最慢的一个。
+        """
+        from lark_card import session_model
+        claude_sessions = [s for s in sessions if s.get("agent", "claude") == "claude"]
+        if not claude_sessions:
+            return {}
+        results = await asyncio.gather(
+            *(asyncio.to_thread(session_model, s) for s in claude_sessions),
+            return_exceptions=True,
+        )
+        models: dict[str, str] = {}
+        for s, m in zip(claude_sessions, results):
+            if isinstance(m, str) and m:
+                models[s["id"]] = m
+        return models
 
     def _read_model(self, s: dict) -> str:
         """读取会话当前模型（transcript 最后一条 assistant 的 model）"""
